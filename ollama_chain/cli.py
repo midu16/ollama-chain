@@ -6,6 +6,7 @@ import sys
 
 from .models import discover_models, model_names, pick_models, list_models_table
 from .chains import CHAINS, chain_pcap
+from .memory import PersistentMemory
 
 
 def detect_pcap_path(text: str) -> str | None:
@@ -28,14 +29,22 @@ def main():
         epilog="""\
 modes:
   cascade     Chain ALL models smallest→largest, each refining the answer (default)
+  auto        Router classifies complexity, picks the best strategy automatically
   consensus   All models answer independently, strongest merges the best parts
   route       Fast model scores complexity, routes to fast or strong
   pipeline    Fast model extracts + classifies, strong model reasons
   verify      Fast model drafts, strong model verifies and refines
   search      Search-first: always fetches web results, strong model synthesizes
+  agent       Autonomous agent with planning, memory, tools, and dynamic control flow
   pcap        Analyze a .pcap file (auto-detected from query, or use --pcap)
   fast        Direct to smallest/fastest model
   strong      Direct to largest/strongest model
+
+agent mode:
+  The agent decomposes a goal into steps, uses tools (shell, file I/O,
+  web search, python eval) to gather information, persists facts to
+  long-term memory (~/.ollama_chain/), and re-plans dynamically on
+  failures.  Use --max-iterations to control the execution budget.
 
 web search:
   All modes automatically search the web for context (via DuckDuckGo).
@@ -49,10 +58,13 @@ examples:
   %(prog)s "What is a binary search tree?"
   %(prog)s -m consensus "Compare REST vs GraphQL"
   %(prog)s -m search "latest Linux kernel release"
+  %(prog)s -m agent "Find out what Linux kernel my machine is running and explain its key features"
+  %(prog)s -m agent --max-iterations 20 "Research and summarize the CVEs from last week"
   %(prog)s --no-search "What is 2+2?"
   %(prog)s -m pcap --pcap capture.pcap
   %(prog)s "Analyze /tmp/dump.pcap for errors"
   %(prog)s --list-models
+  %(prog)s --clear-memory
 """,
     )
     parser.add_argument("query", nargs="*", help="Query to process")
@@ -78,12 +90,53 @@ examples:
         help="Override which model is used for search query generation",
     )
     parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=15,
+        metavar="N",
+        help="Max agent loop iterations (default: 15, agent mode only)",
+    )
+    parser.add_argument(
         "--list-models",
         action="store_true",
         help="List available Ollama models and exit",
     )
+    parser.add_argument(
+        "--clear-memory",
+        action="store_true",
+        help="Clear the agent's persistent memory and exit",
+    )
+    parser.add_argument(
+        "--show-memory",
+        action="store_true",
+        help="Show stored facts and recent sessions, then exit",
+    )
 
     args = parser.parse_args()
+
+    # --- Memory management commands (no models needed) ---
+    if args.clear_memory:
+        PersistentMemory().clear()
+        print("Agent memory cleared.")
+        sys.exit(0)
+
+    if args.show_memory:
+        mem = PersistentMemory()
+        facts = mem.get_facts()
+        sessions = mem.get_recent_sessions()
+        if not facts and not sessions:
+            print("No stored memory yet.")
+        else:
+            if facts:
+                print("=== Stored Facts ===")
+                for f in facts:
+                    print(f"  - {f}")
+            if sessions:
+                print("\n=== Recent Sessions ===")
+                for s in sessions:
+                    print(f"  [{s['session_id']}] {s['goal']}")
+                    print(f"    {s['summary']}")
+        sys.exit(0)
 
     models = discover_models()
     all_names = model_names(models)
@@ -127,9 +180,18 @@ examples:
         sys.exit(1)
 
     chain_fn = CHAINS[args.mode]
-    result = chain_fn(
-        query, all_names,
-        web_search=use_search,
-        fast=fast_override,
-    )
+
+    if args.mode == "agent":
+        result = chain_fn(
+            query, all_names,
+            web_search=use_search,
+            fast=fast_override,
+            max_iterations=args.max_iterations,
+        )
+    else:
+        result = chain_fn(
+            query, all_names,
+            web_search=use_search,
+            fast=fast_override,
+        )
     print(result)

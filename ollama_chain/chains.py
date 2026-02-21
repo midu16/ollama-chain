@@ -2,35 +2,10 @@
 
 import sys
 
-import ollama as ollama_client
-
+from .common import SOURCE_GUIDANCE, ask
 from .pcap import analyze_pcap, format_analysis
+from .router import build_fallback_chain, route_query
 from .search import search_for_query
-
-SOURCE_GUIDANCE = (
-    "When making factual claims, reference authoritative public sources such as: "
-    "official documentation (e.g. Red Hat, kernel.org, Mozilla MDN, Microsoft Docs), "
-    "standards bodies (IEEE, IETF RFCs, ISO, W3C, NIST), "
-    "peer-reviewed publications, and official project repositories. "
-    "Format references as: [Source: <name>, <url or identifier>]. "
-    "If you are uncertain about a claim and cannot back it with a source, say so explicitly."
-)
-
-
-def ask(prompt: str, model: str, thinking: bool = False) -> str:
-    """Send a prompt to an Ollama model and return the response text."""
-    if not thinking:
-        prompt = "/no_think\n" + prompt
-    response = ollama_client.chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    content = response["message"]["content"]
-    if "<think>" in content:
-        end = content.find("</think>")
-        if end != -1:
-            content = content[end + len("</think>"):].strip()
-    return content
 
 
 def _enrich_with_search(query: str, fast: str, web_search: bool) -> str:
@@ -68,54 +43,88 @@ def chain_cascade(
       2. Smallest model produces initial draft
       3. Each subsequent model reviews, corrects, and refines
       4. Largest model produces the final authoritative answer
+
+    Error handling: if an intermediate model fails (all retries exhausted),
+    it is skipped and the cascade continues.  If the draft or final model
+    fails, the system falls back to the next available model.
     """
     fast_name = fast or all_models[0]
     search_ctx = _enrich_with_search(query, fast_name, web_search)
     n = len(all_models)
+    skipped: list[str] = []
 
     # --- Stage 1: first model drafts ---
-    print(f"[cascade 1/{n}] Drafting with {all_models[0]}...", file=sys.stderr)
     draft_prompt = (
         f"{SOURCE_GUIDANCE}\n\n"
         f"Answer the following question thoroughly and accurately.\n\n"
         f"Question: {query}"
     )
-    current_answer = ask(
-        _inject_search_context(draft_prompt, search_ctx),
-        model=all_models[0],
-    )
+    enriched_draft = _inject_search_context(draft_prompt, search_ctx)
 
-    if n == 1:
+    current_answer: str | None = None
+    for draft_model in all_models:
+        print(f"[cascade 1/{n}] Drafting with {draft_model}...", file=sys.stderr)
+        try:
+            current_answer = ask(enriched_draft, model=draft_model)
+            break
+        except Exception as e:
+            print(
+                f"[cascade] {draft_model} failed during draft ({e}), "
+                f"trying fallback...",
+                file=sys.stderr,
+            )
+            skipped.append(draft_model)
+    if current_answer is None:
+        raise RuntimeError(
+            "All models failed during cascade draft stage"
+        )
+
+    if n == 1 or len(skipped) == n - 1:
+        if skipped:
+            print(
+                f"[cascade] Skipped models: {skipped}",
+                file=sys.stderr,
+            )
         return current_answer
 
     # --- Stages 2..N-1: intermediate models review and refine ---
-    for i, model in enumerate(all_models[1:-1], start=2):
+    review_models = [
+        m for m in all_models[1:-1] if m not in skipped
+    ]
+    for i, model in enumerate(review_models, start=2):
         print(f"[cascade {i}/{n}] Reviewing with {model}...", file=sys.stderr)
-        current_answer = ask(
-            f"You are a reviewer improving the accuracy of an answer.\n"
-            f"{SOURCE_GUIDANCE}\n\n"
-            f"Original question: {query}\n\n"
-            f"Current answer:\n{current_answer}\n\n"
-            f"Instructions:\n"
-            f"- Fix any factual errors\n"
-            f"- Add missing important information\n"
-            f"- Strengthen source references (add [Source: ...] citations)\n"
-            f"- Remove unsupported speculation\n"
-            f"- Improve clarity and structure\n"
-            f"- Preserve what is already correct\n"
-            f"Output ONLY the improved answer, not a commentary on the changes."
-            + (f"\n{search_ctx}" if search_ctx else ""),
-            model=model,
-            thinking=True,
-        )
+        try:
+            current_answer = ask(
+                f"You are a reviewer improving the accuracy of an answer.\n"
+                f"{SOURCE_GUIDANCE}\n\n"
+                f"Original question: {query}\n\n"
+                f"Current answer:\n{current_answer}\n\n"
+                f"Instructions:\n"
+                f"- Fix any factual errors\n"
+                f"- Add missing important information\n"
+                f"- Strengthen source references (add [Source: ...] citations)\n"
+                f"- Remove unsupported speculation\n"
+                f"- Improve clarity and structure\n"
+                f"- Preserve what is already correct\n"
+                f"Output ONLY the improved answer, not a commentary on the changes."
+                + (f"\n{search_ctx}" if search_ctx else ""),
+                model=model,
+                thinking=True,
+            )
+        except Exception as e:
+            print(
+                f"[cascade {i}/{n}] {model} failed ({e}), skipping...",
+                file=sys.stderr,
+            )
+            skipped.append(model)
 
     # --- Final stage: strongest model produces authoritative answer ---
-    print(f"[cascade {n}/{n}] Final answer with {all_models[-1]}...", file=sys.stderr)
-    return ask(
+    final_prompt = (
         f"You are the final reviewer producing the definitive answer.\n"
         f"{SOURCE_GUIDANCE}\n\n"
         f"Original question: {query}\n\n"
-        f"Draft answer (refined by {n - 1} model(s)):\n{current_answer}\n\n"
+        f"Draft answer (refined by {n - 1 - len(skipped)} model(s)):\n"
+        f"{current_answer}\n\n"
         f"Instructions:\n"
         f"- Verify all factual claims and correct any remaining errors\n"
         f"- Ensure every key claim has a [Source: ...] reference to an authoritative source "
@@ -125,10 +134,42 @@ def chain_cascade(
         f"- Produce a clean, well-structured final answer\n"
         f"- Do NOT include meta-commentary about the review process\n"
         f"Output ONLY the final authoritative answer."
-        + (f"\n{search_ctx}" if search_ctx else ""),
-        model=all_models[-1],
-        thinking=True,
+        + (f"\n{search_ctx}" if search_ctx else "")
     )
+
+    final_models = [all_models[-1]] + build_fallback_chain(
+        all_models, all_models[-1],
+    )
+    for final_model in final_models:
+        if final_model in skipped:
+            continue
+        print(
+            f"[cascade {n}/{n}] Final answer with {final_model}...",
+            file=sys.stderr,
+        )
+        try:
+            result = ask(final_prompt, model=final_model, thinking=True)
+            if skipped:
+                print(
+                    f"[cascade] Completed with skipped models: {skipped}",
+                    file=sys.stderr,
+                )
+            return result
+        except Exception as e:
+            print(
+                f"[cascade] {final_model} failed during final stage ({e}), "
+                f"trying fallback...",
+                file=sys.stderr,
+            )
+            skipped.append(final_model)
+
+    if skipped:
+        print(
+            f"[cascade] All final-stage models failed; returning best draft. "
+            f"Skipped: {skipped}",
+            file=sys.stderr,
+        )
+    return current_answer
 
 
 # ---------------------------------------------------------------------------
@@ -418,8 +459,82 @@ def chain_pcap(
     return ask(_inject_search_context(prompt, search_ctx), model=strong_name, thinking=True)
 
 
+# ---------------------------------------------------------------------------
+# AGENT — autonomous mode with planning, memory, tools, and control flow
+# ---------------------------------------------------------------------------
+
+def chain_agent(
+    query: str, all_models: list[str], *,
+    web_search: bool = True, fast: str | None = None,
+    max_iterations: int = 15,
+) -> str:
+    """
+    Autonomous agent mode:
+      1. Planner decomposes the goal into steps
+      2. Agent executes steps using tools (shell, files, web search, python)
+      3. Memory persists facts and session history across runs
+      4. Control flow dynamically re-plans on failures
+    """
+    from .agent import run_agent
+
+    return run_agent(
+        query, all_models,
+        web_search=web_search,
+        fast=fast,
+        max_iterations=max_iterations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# AUTO — router-driven mode selection
+# ---------------------------------------------------------------------------
+
+def chain_auto(
+    query: str, all_models: list[str], *,
+    web_search: bool = True, fast: str | None = None,
+) -> str:
+    """Auto-select the optimal chain mode based on query routing.
+
+    The router classifies query complexity and picks the best strategy:
+      simple   → direct to fast model (skip search)
+      moderate → subset cascade (fast + strong)
+      complex  → full cascade through all models
+    """
+    fast_name = fast or all_models[0]
+    decision = route_query(
+        query, all_models,
+        fast_model=fast_name,
+        web_search=web_search,
+    )
+    print(
+        f"[auto] Routed: complexity={decision.complexity} "
+        f"strategy={decision.strategy} models={len(decision.models)} "
+        f"({decision.reasoning})",
+        file=sys.stderr,
+    )
+
+    use_search = web_search and not decision.skip_search
+
+    if decision.strategy == "direct_fast":
+        return chain_fast(
+            query, all_models, web_search=use_search, fast=fast,
+        )
+    if decision.strategy == "direct_strong":
+        return chain_strong(
+            query, all_models, web_search=use_search, fast=fast,
+        )
+    if decision.strategy == "subset_cascade":
+        return chain_cascade(
+            query, decision.models, web_search=use_search, fast=fast,
+        )
+    return chain_cascade(
+        query, all_models, web_search=use_search, fast=fast,
+    )
+
+
 CHAINS = {
     "cascade": chain_cascade,
+    "auto": chain_auto,
     "route": chain_route,
     "pipeline": chain_pipeline,
     "verify": chain_verify,
@@ -427,4 +542,5 @@ CHAINS = {
     "search": chain_search,
     "fast": chain_fast,
     "strong": chain_strong,
+    "agent": chain_agent,
 }

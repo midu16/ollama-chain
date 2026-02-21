@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ollama-chain"
+version = "0.3.0"
+description = "Chain all local Ollama models with autonomous agent capabilities. Fully self-hosted, no API keys."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "ollama>=0.1.9",
+    "scapy>=2.7.0",
+    "ddgs>=9.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "build>=1.0",
+]
+
+[project.scripts]
+ollama-chain = "ollama_chain.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ollama_chain*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -66,9 +66,9 @@ def format_search_results(results: list[SearchResult]) -> str:
 
 def generate_search_queries(query: str, fast_model: str) -> list[str]:
     """Use the fast model to generate optimal search queries from the user's question."""
-    import ollama as ollama_client
+    from .common import chat_with_retry
 
-    response = ollama_client.chat(
+    response = chat_with_retry(
         model=fast_model,
         messages=[{"role": "user", "content": (
             "/no_think\n"

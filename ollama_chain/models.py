@@ -31,6 +31,13 @@ def _parse_param_size(raw: str) -> float:
         return 0.0
 
 
+def _get(obj, key, default=None):
+    """Access a field from either a dict or a pydantic model."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 def discover_models() -> list[ModelInfo]:
     """Query Ollama API and return sorted list of available models (smallest first)."""
     try:
@@ -39,15 +46,20 @@ def discover_models() -> list[ModelInfo]:
         print(f"Error: cannot reach Ollama at localhost:11434 — {e}", file=sys.stderr)
         sys.exit(1)
 
+    raw_models = _get(response, "models", None) or []
+
     models = []
-    for m in response.get("models", []):
-        details = m.get("details", {})
+    for m in raw_models:
+        details = _get(m, "details", {}) or {}
+        name = _get(m, "model", None) or _get(m, "name", "unknown")
         models.append(ModelInfo(
-            name=m["name"],
-            parameter_size=_parse_param_size(details.get("parameter_size", "0")),
-            quantization=details.get("quantization_level", "unknown"),
-            family=details.get("family", "unknown"),
-            size_bytes=m.get("size", 0),
+            name=name,
+            parameter_size=_parse_param_size(
+                _get(details, "parameter_size", "0") or "0",
+            ),
+            quantization=_get(details, "quantization_level", "unknown") or "unknown",
+            family=_get(details, "family", "unknown") or "unknown",
+            size_bytes=_get(m, "size", 0) or 0,
         ))
 
     models.sort(key=lambda m: m.parameter_size)
@@ -74,12 +86,13 @@ def pick_models(models: list[ModelInfo]) -> tuple[ModelInfo, ModelInfo]:
 
 def list_models_table(models: list[ModelInfo]) -> str:
     """Format models as a human-readable table with cascade order."""
-    lines = [f"{'#':<4} {'MODEL':<25} {'PARAMS':<10} {'QUANT':<10} {'FAMILY':<10} {'SIZE':<10}"]
-    lines.append("-" * 69)
+    lines = [f"{'#':<4} {'MODEL':<30} {'PARAMS':<10} {'QUANT':<10} {'FAMILY':<12} {'SIZE':<10}"]
+    lines.append("-" * 76)
     for i, m in enumerate(models, 1):
         size_gb = m.size_bytes / (1024 ** 3)
+        params = f"{m.parameter_size:.1f}B"
         lines.append(
-            f"{i:<4} {m.name:<25} {m.parameter_size:<10.1f}B {m.quantization:<10} "
-            f"{m.family:<10} {size_gb:.1f} GB"
+            f"{i:<4} {m.name:<30} {params:<10} {m.quantization:<10} "
+            f"{m.family:<12} {size_gb:.1f} GB"
         )
     return "\n".join(lines)
