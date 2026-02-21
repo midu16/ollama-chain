@@ -901,3 +901,4 @@ def _finalize_session(session: SessionMemory, persistent: PersistentMemory):
     )
     persistent.store_session_summary(session.session_id, session.goal, summary)
     print("[agent] Session saved to memory.", file=sys.stderr)
+    session.clear()

@@ -28,7 +28,7 @@ def chat_with_retry(
     messages: list[dict],
     *,
     retries: int = MAX_RETRIES,
-    keep_alive: str = "10m",
+    keep_alive: str = "5m",
 ) -> dict:
     """Call ollama.chat with automatic retry on transient errors."""
     last_err = None
@@ -71,6 +71,23 @@ def sanitize_messages(messages: list[dict]) -> list[dict]:
         else:
             merged.append(msg.copy())
     return merged
+
+
+def unload_model(model: str):
+    """Tell Ollama to unload a model from memory immediately."""
+    try:
+        ollama_client.generate(model=model, prompt="", keep_alive=0)
+    except Exception:
+        pass
+
+
+def unload_all_models(models: list[str]):
+    """Unload all specified models from Ollama to free system memory."""
+    seen: set[str] = set()
+    for model in models:
+        if model not in seen:
+            seen.add(model)
+            unload_model(model)
 
 
 def ask(prompt: str, model: str, thinking: bool = False) -> str:

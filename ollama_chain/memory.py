@@ -225,6 +225,14 @@ class SessionMemory:
     def pending_steps(self) -> list[dict]:
         return [s for s in self.plan if s["status"] == "pending"]
 
+    def clear(self):
+        """Release all session data to free memory."""
+        self.plan.clear()
+        self.history.clear()
+        self.facts.clear()
+        self.tool_results.clear()
+        self.goal = ""
+
 
 # ---------------------------------------------------------------------------
 # Relevance scoring helper

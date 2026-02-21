@@ -2,10 +2,12 @@
 """CLI entry point for ollama-chain."""
 
 import argparse
+import gc
 import sys
 
-from .models import discover_models, model_names, pick_models, list_models_table
+from .models import discover_models, ensure_memory_available, model_names, pick_models, list_models_table
 from .chains import CHAINS, chain_pcap
+from .common import unload_all_models
 from .memory import PersistentMemory
 
 
@@ -141,6 +143,8 @@ examples:
     models = discover_models()
     all_names = model_names(models)
 
+    ensure_memory_available(all_names)
+
     if args.list_models:
         print(list_models_table(models))
         print(f"\n{len(models)} model(s) available.")
@@ -162,36 +166,36 @@ examples:
     if not pcap_path and query:
         pcap_path = detect_pcap_path(query)
 
-    if args.mode == "pcap" or pcap_path:
-        if not pcap_path:
-            print("Error: pcap mode requires a .pcap file path (--pcap or in query)", file=sys.stderr)
+    try:
+        if args.mode == "pcap" or pcap_path:
+            if not pcap_path:
+                print("Error: pcap mode requires a .pcap file path (--pcap or in query)", file=sys.stderr)
+                sys.exit(1)
+            result = chain_pcap(
+                pcap_path, all_names,
+                query=query or None,
+                web_search=use_search,
+                fast=fast_override,
+            )
+        elif not query:
+            parser.print_help()
             sys.exit(1)
-        result = chain_pcap(
-            pcap_path, all_names,
-            query=query or None,
-            web_search=use_search,
-            fast=fast_override,
-        )
+        elif args.mode == "agent":
+            chain_fn = CHAINS[args.mode]
+            result = chain_fn(
+                query, all_names,
+                web_search=use_search,
+                fast=fast_override,
+                max_iterations=args.max_iterations,
+            )
+        else:
+            chain_fn = CHAINS[args.mode]
+            result = chain_fn(
+                query, all_names,
+                web_search=use_search,
+                fast=fast_override,
+            )
         print(result)
-        return
-
-    if not query:
-        parser.print_help()
-        sys.exit(1)
-
-    chain_fn = CHAINS[args.mode]
-
-    if args.mode == "agent":
-        result = chain_fn(
-            query, all_names,
-            web_search=use_search,
-            fast=fast_override,
-            max_iterations=args.max_iterations,
-        )
-    else:
-        result = chain_fn(
-            query, all_names,
-            web_search=use_search,
-            fast=fast_override,
-        )
-    print(result)
+    finally:
+        unload_all_models(all_names)
+        gc.collect()
