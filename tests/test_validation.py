@@ -4,6 +4,8 @@ import pytest
 
 from ollama_chain.validation import (
     ValidationError,
+    detect_circular_deps,
+    validate_and_fix_plan,
     validate_model_sequence,
     validate_plan,
     validate_step,
@@ -78,6 +80,108 @@ class TestValidatePlan:
 
     def test_empty_plan(self):
         assert validate_plan([]) == []
+
+
+class TestValidateAndFixPlan:
+    def test_clean_plan_unchanged(self):
+        plan = [
+            {"id": 1, "description": "A", "tool": "shell", "depends_on": [], "status": "pending"},
+            {"id": 2, "description": "B", "tool": "none", "depends_on": [1], "status": "pending"},
+        ]
+        fixed, warnings = validate_and_fix_plan(plan)
+        assert warnings == []
+        assert fixed == plan
+
+    def test_fixes_unknown_tool(self):
+        plan = [
+            {"id": 1, "description": "Do X", "tool": "magic_wand", "depends_on": []},
+        ]
+        fixed, warnings = validate_and_fix_plan(plan)
+        assert fixed[0]["tool"] == "none"
+        assert any("magic_wand" in w for w in warnings)
+
+    def test_fixes_missing_description(self):
+        plan = [
+            {"id": 1, "tool": "shell", "description": "", "depends_on": []},
+        ]
+        fixed, warnings = validate_and_fix_plan(plan)
+        assert fixed[0]["description"] == "Step 1"
+        assert any("placeholder" in w for w in warnings)
+
+    def test_fixes_dangling_deps(self):
+        plan = [
+            {"id": 1, "description": "A", "tool": "shell", "depends_on": [99]},
+        ]
+        fixed, warnings = validate_and_fix_plan(plan)
+        assert 99 not in fixed[0]["depends_on"]
+        assert any("dangling" in w for w in warnings)
+
+    def test_fixes_non_list_depends_on(self):
+        plan = [
+            {"id": 1, "description": "A", "tool": "shell", "depends_on": "bad"},
+        ]
+        fixed, warnings = validate_and_fix_plan(plan)
+        assert fixed[0]["depends_on"] == []
+        assert any("invalid" in w.lower() for w in warnings)
+
+    def test_adds_default_status(self):
+        plan = [
+            {"id": 1, "description": "A", "tool": "shell", "depends_on": []},
+        ]
+        fixed, warnings = validate_and_fix_plan(plan)
+        assert fixed[0]["status"] == "pending"
+
+    def test_preserves_existing_status(self):
+        plan = [
+            {"id": 1, "description": "A", "tool": "shell", "depends_on": [], "status": "completed"},
+        ]
+        fixed, _ = validate_and_fix_plan(plan)
+        assert fixed[0]["status"] == "completed"
+
+    def test_multiple_fixes(self):
+        plan = [
+            {"id": 1, "description": "", "tool": "nonexistent", "depends_on": [99]},
+        ]
+        fixed, warnings = validate_and_fix_plan(plan)
+        assert len(warnings) == 3
+        assert fixed[0]["tool"] == "none"
+        assert fixed[0]["description"] == "Step 1"
+        assert fixed[0]["depends_on"] == []
+
+
+class TestDetectCircularDeps:
+    def test_no_cycles(self):
+        plan = [
+            {"id": 1, "depends_on": []},
+            {"id": 2, "depends_on": [1]},
+            {"id": 3, "depends_on": [2]},
+        ]
+        assert detect_circular_deps(plan) == []
+
+    def test_direct_cycle(self):
+        plan = [
+            {"id": 1, "depends_on": [2]},
+            {"id": 2, "depends_on": [1]},
+        ]
+        cycles = detect_circular_deps(plan)
+        assert len(cycles) > 0
+
+    def test_self_loop(self):
+        plan = [
+            {"id": 1, "depends_on": [1]},
+        ]
+        cycles = detect_circular_deps(plan)
+        assert len(cycles) > 0
+
+    def test_no_deps(self):
+        plan = [
+            {"id": 1, "depends_on": []},
+            {"id": 2, "depends_on": []},
+        ]
+        assert detect_circular_deps(plan) == []
+
+    def test_empty_plan(self):
+        assert detect_circular_deps([]) == []
 
 
 class TestValidateModelSequence:

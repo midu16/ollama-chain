@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ollama-chain"
-version = "0.3.0"
+version = "0.6.0"
 description = "Chain all local Ollama models with autonomous agent capabilities. Fully self-hosted, no API keys."
 readme = "README.md"
 license = "MIT"

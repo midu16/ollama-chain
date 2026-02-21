@@ -124,10 +124,18 @@ User goal
     │
     ├── 1. PLANNING ── fast model decomposes goal into ordered steps
     │       each step tagged with a tool: shell, web_search, read_file, ...
+    │       plan validated + auto-fixed (dangling deps, unknown tools, cycles)
+    │
+    ├── 1b. ROUTING OPTIMIZATION ── assign preferred models per step
+    │       data-gathering steps → fast model
+    │       reasoning/synthesis steps → strong model
+    │       deprioritise previously failed models
     │
     ├── 2. EXECUTION LOOP (ReAct-style)
     │       │
-    │       ├── Try model fallback chain: strong → medium → fast
+    │       ├── Pre-execution validation (tool availability, dependency checks)
+    │       │
+    │       ├── Try preferred models first, then fallback chain
     │       │   Model outputs <tool_call>, <final_answer>, or <store_fact>
     │       │
     │       ├── If all models fail → auto-execute tool from plan hints
@@ -135,13 +143,22 @@ User goal
     │       │
     │       ├── Extract facts from tool output → store in memory
     │       │
-    │       └── Re-plan on failures every N steps
+    │       └── Monitor & replan (discovery triggers, new facts, failures)
     │
     ├── 3. SYNTHESIS ── strongest available model produces final answer
     │       from all collected tool results and discovered facts
     │
     └── 4. MEMORY ── session summary + facts persisted to ~/.ollama_chain/
 ```
+
+### Agent-Native Enhancements (v0.6.0)
+
+The agent pipeline includes several layers that make it resilient and adaptive:
+
+- **Plan validation & auto-repair** — after the LLM generates a plan, `validate_and_fix_plan()` repairs dangling dependency references, replaces unknown tool names with `"none"`, fills missing descriptions, and detects circular dependency cycles
+- **Plan-level routing optimization** — `optimize_routing()` assigns preferred models to each step based on tool type (data-gathering uses the fast model, reasoning uses the strong model) and deprioritises models that have previously failed
+- **Pre-execution step validation** — before running each step, `_validate_before_execution()` checks tool availability and dependency satisfaction; steps with unknown tools are downgraded to reasoning, steps with unmet deps are skipped
+- **Unified monitoring & replanning** — `monitor_and_replan()` encapsulates three replan triggers (discovery completion, new fact evaluation, accumulated failures) into a single composable function, re-running routing optimization after each replan
 
 ### Planning
 

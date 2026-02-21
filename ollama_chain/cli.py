@@ -9,6 +9,8 @@ from .models import discover_models, ensure_memory_available, model_names, pick_
 from .chains import CHAINS, chain_pcap
 from .common import unload_all_models
 from .memory import PersistentMemory
+from .metrics import evaluate_prompt, evaluate_mode_alignment, evaluate_response
+from .optimizer import optimize_prompt, format_optimization_report
 
 
 def detect_pcap_path(text: str) -> str | None:
@@ -56,6 +58,20 @@ source citations:
   All modes instruct models to cite authoritative sources (IETF RFCs,
   IEEE, ISO, NIST, W3C, Red Hat, kernel.org, MDN, official docs).
 
+prompt quality metrics:
+  Use --metrics to display prompt quality scores alongside normal execution.
+  Use --metrics-only to evaluate prompt quality without running any models.
+  Metrics include: clarity, specificity, structure, actionability, context
+  sufficiency, delimiter usage, chain-of-thought readiness, few-shot
+  readiness, task decomposition, and mode alignment.
+
+prompt optimization:
+  Use --optimize to rewrite your prompt using LLM-driven optimization
+  before execution. Applies techniques from the Prompt Engineering Guide:
+  specificity, structured I/O, delimiters, task decomposition, few-shot
+  examples, chain-of-thought, and ReAct patterns.
+  Use --optimize-only to get the improved prompt without running it.
+
 examples:
   %(prog)s "What is a binary search tree?"
   %(prog)s -m consensus "Compare REST vs GraphQL"
@@ -65,6 +81,10 @@ examples:
   %(prog)s --no-search "What is 2+2?"
   %(prog)s -m pcap --pcap capture.pcap
   %(prog)s "Analyze /tmp/dump.pcap for errors"
+  %(prog)s --metrics "Explain the TCP three-way handshake step by step"
+  %(prog)s --metrics-only "Compare REST vs GraphQL for microservice architectures"
+  %(prog)s --optimize "explain docker"
+  %(prog)s --optimize-only "tell me about networking stuff"
   %(prog)s --list-models
   %(prog)s --clear-memory
 """,
@@ -112,6 +132,26 @@ examples:
         "--show-memory",
         action="store_true",
         help="Show stored facts and recent sessions, then exit",
+    )
+    parser.add_argument(
+        "--metrics",
+        action="store_true",
+        help="Evaluate and display prompt quality metrics before execution",
+    )
+    parser.add_argument(
+        "--metrics-only",
+        action="store_true",
+        help="Evaluate prompt quality metrics and exit (no model execution)",
+    )
+    parser.add_argument(
+        "--optimize",
+        action="store_true",
+        help="Optimize the prompt using LLM before execution (shows before/after)",
+    )
+    parser.add_argument(
+        "--optimize-only",
+        action="store_true",
+        help="Optimize and display the improved prompt, then exit (no execution)",
     )
 
     args = parser.parse_args()
@@ -162,11 +202,46 @@ examples:
 
     query = " ".join(args.query) if args.query else ""
 
+    # --- Prompt quality metrics ---
+    if (args.metrics or args.metrics_only) and query:
+        prompt_metrics = evaluate_prompt(query)
+        mode_score, mode_explanation = evaluate_mode_alignment(query, args.mode)
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(prompt_metrics.summary(), file=sys.stderr)
+        bar_len = int(mode_score * 20)
+        bar = "█" * bar_len + "░" * (20 - bar_len)
+        print(
+            f"  {'Mode Alignment':<22} {bar} {mode_score * 100:5.1f}%  "
+            f"{mode_explanation}",
+            file=sys.stderr,
+        )
+        print(f"{'='*60}\n", file=sys.stderr)
+        if args.metrics_only:
+            sys.exit(0)
+
+    # --- Prompt optimization ---
+    if (args.optimize or args.optimize_only) and query:
+        opt_model = fast_override or all_names[0]
+        optimized, before, after = optimize_prompt(
+            query, opt_model, mode=args.mode,
+        )
+        report = format_optimization_report(
+            query, optimized, before, after, args.mode,
+        )
+        print(report, file=sys.stderr)
+        if args.optimize_only:
+            print(optimized)
+            sys.exit(0)
+        query = optimized
+
     pcap_path = args.pcap
     if not pcap_path and query:
         pcap_path = detect_pcap_path(query)
 
     try:
+        import time as _time
+        _t0 = _time.monotonic()
+
         if args.mode == "pcap" or pcap_path:
             if not pcap_path:
                 print("Error: pcap mode requires a .pcap file path (--pcap or in query)", file=sys.stderr)
@@ -195,6 +270,16 @@ examples:
                 web_search=use_search,
                 fast=fast_override,
             )
+
+        elapsed_ms = (_time.monotonic() - _t0) * 1000
+
+        if args.metrics and query:
+            resp_metrics = evaluate_response(query, result, elapsed_ms)
+            print(f"\n{'='*60}", file=sys.stderr)
+            print("Response Metrics:", file=sys.stderr)
+            print(resp_metrics.summary(), file=sys.stderr)
+            print(f"{'='*60}", file=sys.stderr)
+
         print(result)
     finally:
         unload_all_models(all_names)

@@ -193,6 +193,113 @@ def route_query(
 
 
 # ---------------------------------------------------------------------------
+# Plan-level routing optimization
+# ---------------------------------------------------------------------------
+
+_DATA_GATHERING_TOOLS = frozenset({
+    "shell", "read_file", "list_dir", "web_search", "web_search_news",
+})
+
+_REASONING_KEYWORDS = frozenset({
+    "analyze", "synthesize", "summarize", "evaluate", "compare",
+    "explain", "propose", "recommend", "conclude", "reason",
+    "design", "architect", "optimize", "review", "assess",
+})
+
+
+def optimize_routing(
+    plan: list[dict],
+    all_models: list[str],
+    complexity: str,
+    *,
+    failed_models: set[str] | None = None,
+) -> list[dict]:
+    """Assign preferred model lists to each plan step.
+
+    Enriches each step with a ``preferred_models`` key containing an
+    ordered list of models best suited for that step, considering:
+      - Tool type (data-gathering vs reasoning)
+      - Step description keywords
+      - Overall query complexity
+      - Previously failed models (deprioritised)
+
+    Returns the plan with ``preferred_models`` added to each step.
+    """
+    if not all_models:
+        return plan
+
+    fast = all_models[0]
+    strong = all_models[-1]
+    failed = failed_models or set()
+
+    for step in plan:
+        if step.get("status") == "completed":
+            continue
+
+        tool = step.get("tool", "none")
+        desc_lower = step.get("description", "").lower()
+
+        if tool in _DATA_GATHERING_TOOLS and complexity != COMPLEXITY_COMPLEX:
+            preferred = [fast]
+        elif tool == "none":
+            has_reasoning = any(kw in desc_lower for kw in _REASONING_KEYWORDS)
+            if has_reasoning:
+                preferred = [strong]
+            elif complexity == COMPLEXITY_SIMPLE:
+                preferred = [fast]
+            else:
+                preferred = [strong]
+        elif tool == "python_eval":
+            preferred = [fast]
+        else:
+            preferred = list(all_models)
+
+        if failed:
+            filtered = [m for m in preferred if m not in failed]
+            if not filtered:
+                filtered = [m for m in all_models if m not in failed]
+            preferred = filtered or preferred
+
+        step["preferred_models"] = preferred
+
+    return plan
+
+
+def identify_parallel_candidates(plan: list[dict]) -> list[list[int]]:
+    """Identify groups of step IDs that can execute concurrently.
+
+    Unlike ``detect_parallel_groups`` in the planner (which returns step
+    dicts), this returns ID groups suitable for routing decisions — letting
+    the router assign lighter models to parallel data-gathering batches.
+    """
+    completed_ids = {s["id"] for s in plan if s["status"] == "completed"}
+    pending = [s for s in plan if s["status"] == "pending"]
+
+    groups: list[list[int]] = []
+    remaining = list(pending)
+
+    while remaining:
+        ready_ids: list[int] = []
+        not_ready: list[dict] = []
+        for step in remaining:
+            deps = set(step.get("depends_on", []))
+            if deps <= completed_ids:
+                ready_ids.append(step["id"])
+            else:
+                not_ready.append(step)
+
+        if not ready_ids:
+            ready_ids = [remaining[0]["id"]]
+            not_ready = remaining[1:]
+
+        groups.append(ready_ids)
+        completed_ids.update(ready_ids)
+        remaining = not_ready
+
+    return groups
+
+
+# ---------------------------------------------------------------------------
 # Fallback helpers
 # ---------------------------------------------------------------------------
 

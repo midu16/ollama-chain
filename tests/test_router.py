@@ -12,6 +12,8 @@ from ollama_chain.router import (
     RouteDecision,
     build_fallback_chain,
     classify_complexity_heuristic,
+    identify_parallel_candidates,
+    optimize_routing,
     route_query,
     select_models_for_step,
 )
@@ -178,3 +180,117 @@ class TestSelectModelsForStep:
         step = {"description": "Do something"}
         models = select_models_for_step(step, MODELS, COMPLEXITY_COMPLEX)
         assert models == [MODELS[-1]]
+
+
+# ---------------------------------------------------------------------------
+# optimize_routing
+# ---------------------------------------------------------------------------
+
+class TestOptimizeRouting:
+    def test_adds_preferred_models(self):
+        plan = [
+            {"id": 1, "description": "List files", "tool": "list_dir",
+             "depends_on": [], "status": "pending"},
+            {"id": 2, "description": "Analyze results", "tool": "none",
+             "depends_on": [1], "status": "pending"},
+        ]
+        result = optimize_routing(plan, MODELS, COMPLEXITY_MODERATE)
+        assert "preferred_models" in result[0]
+        assert "preferred_models" in result[1]
+
+    def test_data_gathering_uses_fast_for_simple(self):
+        plan = [
+            {"id": 1, "description": "Run uname", "tool": "shell",
+             "depends_on": [], "status": "pending"},
+        ]
+        optimize_routing(plan, MODELS, COMPLEXITY_SIMPLE)
+        assert plan[0]["preferred_models"] == [MODELS[0]]
+
+    def test_reasoning_uses_strong(self):
+        plan = [
+            {"id": 1, "description": "Analyze and summarize the findings",
+             "tool": "none", "depends_on": [], "status": "pending"},
+        ]
+        optimize_routing(plan, MODELS, COMPLEXITY_COMPLEX)
+        assert plan[0]["preferred_models"] == [MODELS[-1]]
+
+    def test_skips_completed_steps(self):
+        plan = [
+            {"id": 1, "description": "Done", "tool": "shell",
+             "depends_on": [], "status": "completed"},
+        ]
+        optimize_routing(plan, MODELS, COMPLEXITY_SIMPLE)
+        assert "preferred_models" not in plan[0]
+
+    def test_deprioritises_failed_models(self):
+        plan = [
+            {"id": 1, "description": "Search web", "tool": "web_search",
+             "depends_on": [], "status": "pending"},
+        ]
+        optimize_routing(
+            plan, MODELS, COMPLEXITY_SIMPLE,
+            failed_models={MODELS[0]},
+        )
+        assert MODELS[0] not in plan[0]["preferred_models"]
+
+    def test_empty_models_safe(self):
+        plan = [
+            {"id": 1, "description": "X", "tool": "shell",
+             "depends_on": [], "status": "pending"},
+        ]
+        result = optimize_routing(plan, [], COMPLEXITY_SIMPLE)
+        assert result == plan
+
+    def test_python_eval_uses_fast(self):
+        plan = [
+            {"id": 1, "description": "Calculate 2+2", "tool": "python_eval",
+             "depends_on": [], "status": "pending"},
+        ]
+        optimize_routing(plan, MODELS, COMPLEXITY_MODERATE)
+        assert plan[0]["preferred_models"] == [MODELS[0]]
+
+
+# ---------------------------------------------------------------------------
+# identify_parallel_candidates
+# ---------------------------------------------------------------------------
+
+class TestIdentifyParallelCandidates:
+    def test_all_independent(self):
+        plan = [
+            {"id": 1, "status": "pending", "depends_on": []},
+            {"id": 2, "status": "pending", "depends_on": []},
+            {"id": 3, "status": "pending", "depends_on": []},
+        ]
+        groups = identify_parallel_candidates(plan)
+        assert len(groups) == 1
+        assert set(groups[0]) == {1, 2, 3}
+
+    def test_linear_chain(self):
+        plan = [
+            {"id": 1, "status": "pending", "depends_on": []},
+            {"id": 2, "status": "pending", "depends_on": [1]},
+            {"id": 3, "status": "pending", "depends_on": [2]},
+        ]
+        groups = identify_parallel_candidates(plan)
+        assert len(groups) == 3
+        assert all(len(g) == 1 for g in groups)
+
+    def test_diamond(self):
+        plan = [
+            {"id": 1, "status": "completed", "depends_on": []},
+            {"id": 2, "status": "pending", "depends_on": [1]},
+            {"id": 3, "status": "pending", "depends_on": [1]},
+            {"id": 4, "status": "pending", "depends_on": [2, 3]},
+        ]
+        groups = identify_parallel_candidates(plan)
+        assert set(groups[0]) == {2, 3}
+        assert groups[1] == [4]
+
+    def test_empty_plan(self):
+        assert identify_parallel_candidates([]) == []
+
+    def test_all_completed(self):
+        plan = [
+            {"id": 1, "status": "completed", "depends_on": []},
+        ]
+        assert identify_parallel_candidates(plan) == []

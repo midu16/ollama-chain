@@ -15,6 +15,7 @@ import re
 import sys
 
 from .common import chat_with_retry
+from .validation import validate_and_fix_plan, detect_circular_deps
 
 
 def decompose_goal(
@@ -71,7 +72,25 @@ def decompose_goal(
         messages=[{"role": "user", "content": prompt}],
     )
     content = _strip_think(response["message"]["content"])
-    return _parse_plan(content, goal)
+    plan = _parse_plan(content, goal)
+    plan, fix_warnings = validate_and_fix_plan(plan)
+    for w in fix_warnings:
+        print(f"[planner] Auto-fix: {w}", file=sys.stderr)
+
+    cycles = detect_circular_deps(plan)
+    if cycles:
+        for a, b in cycles:
+            print(
+                f"[planner] Breaking circular dep: step {a} ↔ {b}",
+                file=sys.stderr,
+            )
+            step = next((s for s in plan if s["id"] == a), None)
+            if step:
+                step["depends_on"] = [
+                    d for d in step["depends_on"] if d != b
+                ]
+
+    return plan
 
 
 def replan(
@@ -104,7 +123,11 @@ def replan(
         messages=[{"role": "user", "content": prompt}],
     )
     content = _strip_think(response["message"]["content"])
-    return _parse_plan(content, goal)
+    plan = _parse_plan(content, goal)
+    plan, fix_warnings = validate_and_fix_plan(plan)
+    for w in fix_warnings:
+        print(f"[planner] Auto-fix (replan): {w}", file=sys.stderr)
+    return plan
 
 
 # ---------------------------------------------------------------------------

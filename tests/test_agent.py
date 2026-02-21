@@ -8,7 +8,10 @@ from ollama_chain.agent import (
     _extract_quoted_strings,
     _is_safe_command,
     _parse_response,
+    _validate_before_execution,
+    monitor_and_replan,
 )
+from ollama_chain.memory import SessionMemory
 
 
 class TestParseResponse:
@@ -182,3 +185,95 @@ class TestExtractFacts:
     def test_list_dir_empty(self):
         facts = _extract_facts_from_output("list_dir", "")
         assert facts == []
+
+
+# ---------------------------------------------------------------------------
+# Pre-execution validation
+# ---------------------------------------------------------------------------
+
+class TestValidateBeforeExecution:
+    def _make_session(self, plan):
+        session = SessionMemory(session_id="test", goal="test")
+        session.plan = plan
+        return session
+
+    def test_valid_step_passes(self):
+        plan = [
+            {"id": 1, "description": "Run cmd", "tool": "shell",
+             "depends_on": [], "status": "pending"},
+        ]
+        session = self._make_session(plan)
+        assert _validate_before_execution(plan[0], session) is True
+
+    def test_unknown_tool_downgraded(self):
+        plan = [
+            {"id": 1, "description": "Magic", "tool": "nonexistent",
+             "depends_on": [], "status": "pending"},
+        ]
+        session = self._make_session(plan)
+        assert _validate_before_execution(plan[0], session) is True
+        assert plan[0]["tool"] == "none"
+
+    def test_unmet_deps_rejected(self):
+        plan = [
+            {"id": 1, "description": "A", "tool": "shell",
+             "depends_on": [], "status": "pending"},
+            {"id": 2, "description": "B", "tool": "shell",
+             "depends_on": [1], "status": "pending"},
+        ]
+        session = self._make_session(plan)
+        assert _validate_before_execution(plan[1], session) is False
+
+    def test_met_deps_pass(self):
+        plan = [
+            {"id": 1, "description": "A", "tool": "shell",
+             "depends_on": [], "status": "completed"},
+            {"id": 2, "description": "B", "tool": "shell",
+             "depends_on": [1], "status": "pending"},
+        ]
+        session = self._make_session(plan)
+        assert _validate_before_execution(plan[1], session) is True
+
+
+# ---------------------------------------------------------------------------
+# Monitor and replan
+# ---------------------------------------------------------------------------
+
+class TestMonitorAndReplan:
+    def _make_session(self, plan, facts=None):
+        session = SessionMemory(session_id="test", goal="test goal")
+        session.plan = plan
+        if facts:
+            session.facts = list(facts)
+        return session
+
+    def test_no_replan_when_no_new_facts(self):
+        plan = [
+            {"id": 1, "description": "A", "tool": "shell",
+             "depends_on": [], "status": "completed"},
+            {"id": 2, "description": "B", "tool": "none",
+             "depends_on": [1], "status": "pending"},
+        ]
+        session = self._make_session(plan)
+        group = [plan[0]]
+
+        did_replan, checkpoint = monitor_and_replan(
+            "goal", session, group, "fast:7b", 0,
+        )
+        assert did_replan is False
+        assert checkpoint == 0
+
+    def test_no_replan_for_non_discovery_without_llm(self):
+        plan = [
+            {"id": 1, "description": "Run uname", "tool": "web_search",
+             "depends_on": [], "status": "completed"},
+            {"id": 2, "description": "B", "tool": "none",
+             "depends_on": [1], "status": "pending"},
+        ]
+        session = self._make_session(plan, facts=["OS: Fedora"])
+        group = [plan[0]]
+
+        did_replan, checkpoint = monitor_and_replan(
+            "goal", session, group, "fast:7b", 0,
+        )
+        assert did_replan is False

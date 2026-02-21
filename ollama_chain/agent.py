@@ -32,9 +32,11 @@ from .planner import (
 from .router import (
     RouteDecision,
     build_fallback_chain,
+    optimize_routing,
     route_query,
     select_models_for_step,
 )
+from .validation import validate_step
 from .tools import (
     execute_tool_with_retry,
     format_tool_descriptions,
@@ -339,6 +341,15 @@ def _execute_step(
     step_id = step["id"]
     step_desc = step["description"]
     step_tool = step.get("tool", "none")
+
+    if not _validate_before_execution(step, session):
+        step["status"] = "failed"
+        session.add_error(
+            f"Step {step_id} skipped: validation failed",
+            step_id=step_id,
+        )
+        return None
+
     step["status"] = "in_progress"
 
     total_steps = len(session.plan)
@@ -378,7 +389,9 @@ def _execute_step(
     messages.append({"role": "user", "content": step_prompt})
     messages = sanitize_messages(messages)
 
-    preferred = select_models_for_step(step, all_models, query_complexity)
+    preferred = step.get("preferred_models") or select_models_for_step(
+        step, all_models, query_complexity,
+    )
     chat_result = _agent_chat(all_models, messages, preferred_models=preferred)
 
     if chat_result is not None:
@@ -506,6 +519,111 @@ def _execute_parallel_group(
 
 
 # ---------------------------------------------------------------------------
+# Pre-execution validation
+# ---------------------------------------------------------------------------
+
+def _validate_before_execution(
+    step: dict,
+    session: SessionMemory,
+) -> bool:
+    """Validate a step before execution.  Returns True if step is safe to run."""
+    completed_ids = {s["id"] for s in session.plan if s["status"] == "completed"}
+    warnings = validate_step(step, completed_steps=completed_ids)
+    if not warnings:
+        return True
+
+    for w in warnings:
+        print(f"[agent]   Validation: {w}", file=sys.stderr)
+
+    if any("Unknown tool" in w for w in warnings):
+        step["tool"] = "none"
+        print("[agent]   Downgraded to reasoning step", file=sys.stderr)
+
+    if any("Unmet" in w for w in warnings):
+        print("[agent]   Skipping — unmet dependencies", file=sys.stderr)
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Monitoring and replanning
+# ---------------------------------------------------------------------------
+
+def monitor_and_replan(
+    goal: str,
+    session: SessionMemory,
+    current_group: list[dict],
+    fast_model: str,
+    facts_at_last_replan: int,
+) -> tuple[bool, int]:
+    """Evaluate execution state and replan if needed.
+
+    Checks three triggers (in priority order):
+      1. Discovery steps completed with new facts → force replan
+      2. New facts that may invalidate remaining steps → ask LLM
+      3. Accumulated failures → force replan
+
+    Returns (did_replan, updated_facts_checkpoint).
+    """
+    new_facts_since = session.facts[facts_at_last_replan:]
+
+    # --- Trigger 1: discovery steps with new facts ---
+    discovery_tools = {"list_dir", "list_dir>shell"}
+    group_was_discovery = any(
+        s.get("tool") in discovery_tools
+        or (s.get("tool") == "shell" and any(
+            kw in s.get("description", "").lower()
+            for kw in ("list", "ls ", "find ", "tree")
+        ))
+        for s in current_group
+    )
+
+    if group_was_discovery and new_facts_since:
+        print(
+            "[agent] Discovery step completed — re-planning with "
+            "actual file listing...",
+            file=sys.stderr,
+        )
+        observations = _build_observations(session)
+        session.plan = replan(goal, session.plan, observations, fast_model)
+        _print_revised_plan(session)
+        return True, len(session.facts)
+
+    # --- Trigger 2: new facts may invalidate remaining steps ---
+    if new_facts_since:
+        try:
+            needs_replan = should_replan(
+                goal, session.plan, new_facts_since, fast_model,
+            )
+        except Exception:
+            needs_replan = False
+
+        if needs_replan:
+            print(
+                "[agent] New facts triggered re-plan...",
+                file=sys.stderr,
+            )
+            observations = _build_observations(session)
+            session.plan = replan(goal, session.plan, observations, fast_model)
+            _print_revised_plan(session)
+            return True, len(session.facts)
+
+    # --- Trigger 3: accumulated failures ---
+    if session.failed_step_count() > 0:
+        print(
+            f"[agent] Re-planning ({session.failed_step_count()} failed)...",
+            file=sys.stderr,
+        )
+        observations = _build_observations(session)
+        session.plan = replan(goal, session.plan, observations, fast_model)
+        _print_revised_plan(session)
+        return True, len(session.facts)
+
+    return False, facts_at_last_replan
+
+
+# ---------------------------------------------------------------------------
 # Agent loop (Gap 1: dynamic reasoning)
 # ---------------------------------------------------------------------------
 
@@ -565,9 +683,13 @@ def run_agent(
 
     session.add("assistant", f"Plan created with {len(plan)} steps.")
 
+    # ---- Phase 1b: Optimize routing for each step -------------------------
+    optimize_routing(plan, all_models, routing.complexity)
+
     # ---- Phase 2: Execution loop ------------------------------------------
     iteration = 0
     facts_at_last_replan = len(session.facts)
+    failed_models: set[str] = set()
 
     while iteration < max_iterations:
         pending = session.pending_steps()
@@ -591,60 +713,16 @@ def run_agent(
             _finalize_session(session, persistent)
             return answer
 
-        # --- Force re-plan after discovery steps (list_dir, initial shell) ---
-        discovery_tools = {"list_dir", "list_dir>shell"}
-        group_was_discovery = any(
-            s.get("tool") in discovery_tools
-            or (s.get("tool") == "shell" and any(
-                kw in s.get("description", "").lower()
-                for kw in ("list", "ls ", "find ", "tree")
-            ))
-            for s in current_group
+        # --- Monitor and replan if needed ---
+        did_replan, facts_at_last_replan = monitor_and_replan(
+            goal, session, current_group, fast_name,
+            facts_at_last_replan,
         )
-        new_facts_since = session.facts[facts_at_last_replan:]
-
-        if group_was_discovery and new_facts_since:
-            print(
-                "[agent] Discovery step completed — re-planning with "
-                "actual file listing...",
-                file=sys.stderr,
+        if did_replan:
+            optimize_routing(
+                session.plan, all_models, routing.complexity,
+                failed_models=failed_models,
             )
-            observations = _build_observations(session)
-            session.plan = replan(goal, session.plan, observations, fast_name)
-            facts_at_last_replan = len(session.facts)
-            _print_revised_plan(session)
-            continue
-
-        # --- Dynamic reasoning: replan on new facts (Gap 1) ---
-        if new_facts_since:
-            try:
-                needs_replan = should_replan(
-                    goal, session.plan, new_facts_since, fast_name,
-                )
-            except Exception:
-                needs_replan = False
-
-            if needs_replan:
-                print(
-                    "[agent] New facts triggered re-plan...",
-                    file=sys.stderr,
-                )
-                observations = _build_observations(session)
-                session.plan = replan(goal, session.plan, observations, fast_name)
-                facts_at_last_replan = len(session.facts)
-                _print_revised_plan(session)
-                continue
-
-        # --- Re-plan on accumulated failures ---
-        if session.failed_step_count() > 0:
-            print(
-                f"[agent] Re-planning ({session.failed_step_count()} failed)...",
-                file=sys.stderr,
-            )
-            observations = _build_observations(session)
-            session.plan = replan(goal, session.plan, observations, fast_name)
-            facts_at_last_replan = len(session.facts)
-            _print_revised_plan(session)
 
     # ---- Phase 3: Final synthesis -----------------------------------------
     _print_step_summary(session)
