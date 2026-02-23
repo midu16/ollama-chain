@@ -1,0 +1,132 @@
+{
+  "name": "ollama-chain",
+  "displayName": "Ollama Chain",
+  "description": "Interact with Ollama Chain agent — choose chain modes, configure settings, and chat with local LLMs directly from VS Code.",
+  "version": "0.2.0",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Chat"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ollama-chain",
+          "title": "Ollama Chain",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ollama-chain": [
+        {
+          "type": "webview",
+          "id": "ollama-chain.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "ollama-chain.sendPrompt",
+        "title": "Ollama Chain: Send Prompt"
+      },
+      {
+        "command": "ollama-chain.clearChat",
+        "title": "Ollama Chain: Clear Chat"
+      },
+      {
+        "command": "ollama-chain.selectMode",
+        "title": "Ollama Chain: Select Chain Mode"
+      },
+      {
+        "command": "ollama-chain.listModels",
+        "title": "Ollama Chain: List Models"
+      },
+      {
+        "command": "ollama-chain.insertCodeBlock",
+        "title": "Ollama Chain: Insert Code Block at Cursor"
+      }
+    ],
+    "configuration": {
+      "title": "Ollama Chain",
+      "properties": {
+        "ollamaChain.mode": {
+          "type": "string",
+          "default": "cascade",
+          "enum": [
+            "cascade",
+            "auto",
+            "route",
+            "pipeline",
+            "verify",
+            "consensus",
+            "search",
+            "fast",
+            "strong",
+            "agent"
+          ],
+          "enumDescriptions": [
+            "Chain ALL models smallest→largest, each refining the answer",
+            "Router classifies complexity and picks the best strategy",
+            "Fast model scores complexity, routes to fast or strong",
+            "Fast model extracts + classifies, strong model reasons",
+            "Fast model drafts, strong model verifies and refines",
+            "All models answer independently, strongest merges",
+            "Search-first: always fetches web results, strong synthesizes",
+            "Direct to smallest/fastest model",
+            "Direct to largest/strongest model",
+            "Autonomous agent with planning, memory, tools, and dynamic control"
+          ],
+          "description": "Default chain mode for processing prompts"
+        },
+        "ollamaChain.webSearch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable web search for additional context (via DuckDuckGo)"
+        },
+        "ollamaChain.maxIterations": {
+          "type": "number",
+          "default": 15,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Maximum iterations for agent mode"
+        },
+        "ollamaChain.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama server URL"
+        },
+        "ollamaChain.cliCommand": {
+          "type": "string",
+          "default": "ollama-chain",
+          "description": "Command to invoke the ollama-chain CLI (e.g. 'ollama-chain' or 'python -m ollama_chain')"
+        },
+        "ollamaChain.cliTimeout": {
+          "type": "number",
+          "default": 300,
+          "minimum": 30,
+          "maximum": 600,
+          "description": "Timeout in seconds for CLI execution"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npm run compile && vsce package --out dist/"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.74.0",
+    "@vscode/vsce": "^3.7.1",
+    "typescript": "^5.3.3"
+  }
+}
