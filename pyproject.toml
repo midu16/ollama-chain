@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ollama-chain"
-version = "0.6.0"
+version = "0.7.0"
 description = "Chain all local Ollama models with autonomous agent capabilities. Fully self-hosted, no API keys."
 readme = "README.md"
 license = "MIT"
@@ -13,6 +13,7 @@ dependencies = [
     "ollama>=0.1.9",
     "scapy>=2.7.0",
     "ddgs>=9.0.0",
+    "aiohttp>=3.9.0",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,7 @@ dev = [
 
 [project.scripts]
 ollama-chain = "ollama_chain.cli:main"
+ollama-chain-server = "ollama_chain.server:main"
 
 [tool.setuptools.packages.find]
 include = ["ollama_chain*"]

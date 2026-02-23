@@ -16,7 +16,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .search import web_search, web_search_news, format_search_results
+from .search import (
+    web_search, web_search_news, format_search_results,
+    github_search, github_search_issues, stackoverflow_search,
+    docs_search,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +158,44 @@ def tool_web_search_news_tool(query: str) -> ToolResult:
     return ToolResult(True, formatted, "web_search_news")
 
 
+def tool_github_search(query: str) -> ToolResult:
+    """Search GitHub repositories and issues."""
+    repos = github_search(query, max_results=3)
+    issues = github_search_issues(query, max_results=3)
+    combined = repos + issues
+    formatted = format_search_results(combined)
+    if not formatted:
+        return ToolResult(
+            False, "No GitHub results found.", "github_search",
+            error_detail="empty_results",
+        )
+    return ToolResult(True, formatted, "github_search")
+
+
+def tool_stackoverflow_search(query: str) -> ToolResult:
+    """Search Stack Overflow for Q&A."""
+    results = stackoverflow_search(query, max_results=5)
+    formatted = format_search_results(results)
+    if not formatted:
+        return ToolResult(
+            False, "No Stack Overflow results found.", "stackoverflow_search",
+            error_detail="empty_results",
+        )
+    return ToolResult(True, formatted, "stackoverflow_search")
+
+
+def tool_docs_search(query: str) -> ToolResult:
+    """Search trusted documentation sites."""
+    results = docs_search(query, max_results=5)
+    formatted = format_search_results(results)
+    if not formatted:
+        return ToolResult(
+            False, "No documentation results found.", "docs_search",
+            error_detail="empty_results",
+        )
+    return ToolResult(True, formatted, "docs_search")
+
+
 def tool_python_eval(code: str) -> ToolResult:
     """Evaluate a Python expression in a restricted namespace."""
     try:
@@ -245,11 +287,47 @@ TOOL_REGISTRY: dict[str, Tool] = {
         parameters={"code": "Python expression to evaluate"},
         function=tool_python_eval,
     ),
+    "github_search": Tool(
+        name="github_search",
+        description=(
+            "Search GitHub repositories and issues. Returns repo names, stars, "
+            "descriptions, and relevant issues/discussions."
+        ),
+        parameters={"query": "The search query for GitHub"},
+        function=tool_github_search,
+        max_retries=2,
+        retry_delay=2.0,
+    ),
+    "stackoverflow_search": Tool(
+        name="stackoverflow_search",
+        description=(
+            "Search Stack Overflow for programming Q&A. Returns questions "
+            "with scores, answer counts, and tags."
+        ),
+        parameters={"query": "The search query for Stack Overflow"},
+        function=tool_stackoverflow_search,
+        max_retries=2,
+        retry_delay=2.0,
+    ),
+    "docs_search": Tool(
+        name="docs_search",
+        description=(
+            "Search trusted official documentation sites (kubernetes.io, "
+            "docs.redhat.com, MDN, python.org, kernel.org, IETF, W3C, etc.)."
+        ),
+        parameters={"query": "The search query for documentation"},
+        function=tool_docs_search,
+        max_retries=2,
+        retry_delay=2.0,
+    ),
 }
 
 TOOL_FALLBACKS: dict[str, list[str]] = {
-    "web_search": ["web_search_news"],
+    "web_search": ["web_search_news", "docs_search"],
     "web_search_news": ["web_search"],
+    "github_search": ["web_search"],
+    "stackoverflow_search": ["web_search"],
+    "docs_search": ["web_search"],
     "read_file": ["shell"],
 }
 
@@ -352,13 +430,17 @@ def execute_tool_with_retry(name: str, args: dict) -> ToolResult:
     )
 
 
+_SEARCH_TOOLS = frozenset({
+    "web_search", "web_search_news", "github_search",
+    "stackoverflow_search", "docs_search",
+})
+
+
 def _adapt_args_for_fallback(
     original: str, fallback: str, args: dict,
 ) -> dict | None:
     """Translate arguments from the original tool to the fallback tool."""
-    if original in ("web_search", "web_search_news") and fallback in (
-        "web_search", "web_search_news",
-    ):
+    if original in _SEARCH_TOOLS and fallback in _SEARCH_TOOLS:
         return {"query": args.get("query", "")}
     if original == "read_file" and fallback == "shell":
         path = args.get("path", "")

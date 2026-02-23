@@ -17,6 +17,8 @@
     const settingsToggle = document.getElementById('settingsToggle');
     const settingsBody = document.getElementById('settingsBody');
     const settingsArrow = document.getElementById('settingsArrow');
+    const sessionBar = document.getElementById('sessionBar');
+    const sessionTimer = document.getElementById('sessionTimer');
 
     const MODE_DESCRIPTIONS = {
         cascade: 'Chain ALL models smallest to largest, each refining the answer.',
@@ -31,8 +33,40 @@
         strong: 'Direct to the largest/strongest model for best quality.',
     };
 
-    let isRunning = false;
-    let currentConfig = {};
+    var isRunning = false;
+    var currentConfig = {};
+    var sessionStartTime = null;
+    var timerInterval = null;
+
+    // ── Session timer ──
+
+    function formatElapsed(ms) {
+        var totalSec = Math.floor(ms / 1000);
+        var min = Math.floor(totalSec / 60);
+        var sec = totalSec % 60;
+        return (min < 10 ? '0' : '') + min + ':' + (sec < 10 ? '0' : '') + sec;
+    }
+
+    function startTimer(startTime) {
+        sessionStartTime = startTime || Date.now();
+        updateTimer();
+        if (timerInterval) { clearInterval(timerInterval); }
+        timerInterval = setInterval(updateTimer, 1000);
+    }
+
+    function stopTimer() {
+        if (timerInterval) {
+            clearInterval(timerInterval);
+            timerInterval = null;
+        }
+        sessionStartTime = null;
+    }
+
+    function updateTimer() {
+        if (sessionStartTime && sessionTimer) {
+            sessionTimer.textContent = formatElapsed(Date.now() - sessionStartTime);
+        }
+    }
 
     // ── Settings Toggle ──
 
@@ -46,7 +80,7 @@
     modeSelect.addEventListener('change', updateModeUI);
 
     function updateModeUI() {
-        const mode = modeSelect.value;
+        var mode = modeSelect.value;
         modeDesc.textContent = MODE_DESCRIPTIONS[mode] || '';
         iterationsRow.style.display = mode === 'agent' ? 'flex' : 'none';
     }
@@ -58,14 +92,13 @@
             mode: modeSelect.value,
             webSearch: webSearchCheck.checked,
             maxIterations: parseInt(maxIter.value, 10) || 15,
-            ollamaUrl: currentConfig.ollamaUrl || 'http://localhost:11434',
-            cliCommand: currentConfig.cliCommand || 'ollama-chain',
-            cliTimeout: currentConfig.cliTimeout || 300,
+            apiUrl: currentConfig.apiUrl || 'http://localhost:8585',
+            timeout: currentConfig.timeout || 300,
         };
     }
 
     function sendPrompt() {
-        const prompt = promptInput.value.trim();
+        var prompt = promptInput.value.trim();
         if (!prompt || isRunning) { return; }
 
         promptInput.value = '';
@@ -114,7 +147,6 @@
         var BT = String.fromCharCode(96);
         var BT3 = BT + BT + BT;
 
-        // 1. Extract fenced code blocks before escaping
         var codeBlocks = [];
         var cbRegex = new RegExp(BT3 + '(\\w*)?\\n([\\s\\S]*?)' + BT3, 'g');
         text = text.replace(cbRegex, function (_, lang, code) {
@@ -124,7 +156,6 @@
             return '\x00CB' + idx + '\x00';
         });
 
-        // 2. Extract inline code before escaping
         var inlineCode = [];
         var icRegex = new RegExp(BT + '([^' + BT + '\\n]+)' + BT, 'g');
         text = text.replace(icRegex, function (_, code) {
@@ -133,38 +164,27 @@
             return '\x00IC' + idx + '\x00';
         });
 
-        // 3. Escape HTML
         var html = escapeHtml(text);
 
-        // 4. Bold & italic
         html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
         html = html.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
 
-        // 5. Headers
         html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
         html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
         html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
 
-        // 6. Bullet lists (- or *)
         html = html.replace(/^[\-\*] (.+)$/gm, '<li>$1</li>');
-
-        // 7. Numbered lists
         html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-
-        // 8. Wrap consecutive <li> in <ul>
         html = html.replace(/((?:<li>[\s\S]*?<\/li>\s*)+)/g, '<ul>$1</ul>');
 
-        // 9. Line breaks (but not inside block elements)
         html = html.replace(/\n/g, '<br>');
         html = html.replace(/<br>\s*(<\/?(?:ul|ol|li|h[2-4]|pre|div))/g, '$1');
         html = html.replace(/(<\/(?:ul|ol|h[2-4]|pre|div)>)\s*<br>/g, '$1');
 
-        // 10. Re-insert inline code
         for (var i = 0; i < inlineCode.length; i++) {
             html = html.replace('\x00IC' + i + '\x00', '<code>' + escapeHtml(inlineCode[i]) + '</code>');
         }
 
-        // 11. Re-insert code blocks
         for (var j = 0; j < codeBlocks.length; j++) {
             var cb = codeBlocks[j];
             var langLabel = cb.lang
@@ -289,7 +309,12 @@
                 sendBtn.disabled = isRunning;
                 sendBtn.style.display = isRunning ? 'none' : 'flex';
                 cancelBtn.classList.toggle('visible', isRunning);
-                if (!isRunning) {
+                if (isRunning) {
+                    sessionBar.classList.add('visible');
+                    startTimer(msg.startTime);
+                } else {
+                    sessionBar.classList.remove('visible');
+                    stopTimer();
                     progressBar.classList.remove('visible');
                 }
                 break;
@@ -318,7 +343,7 @@
         }
     });
 
-    // Request config on load
+    vscode.postMessage({ type: 'ready' });
     vscode.postMessage({ type: 'getConfig' });
     updateModeUI();
     promptInput.focus();

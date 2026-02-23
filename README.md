@@ -1,11 +1,15 @@
+<p align="center">
+  <img src="ollama-chain-vscode-extension/resources/icon.svg" alt="ollama-chain logo" width="128">
+</p>
+
 # ollama-chain
 
-Chain **all** local Ollama models together with web search for maximum answer accuracy. Every available model participates — smallest drafts, each larger model refines, largest delivers the final answer with authoritative source citations. Includes an **autonomous agent** with planning, persistent memory, tool use, and dynamic control flow. Fully self-hosted, no API keys.
+Chain **all** local Ollama models together with **multi-source search** (DuckDuckGo, GitHub, Stack Overflow, trusted documentation sites) for maximum answer accuracy. Every available model participates — smallest drafts, each larger model refines, largest delivers the final answer with authoritative source citations. Includes an **autonomous agent** with planning, persistent memory, tool use, and dynamic control flow. **Kubernetes / OpenShift cluster analysis** via `oc`/`kubectl`. **PCAP network analysis** via Scapy. Exposes an **HTTP API server** with a memory-aware scheduler for safe multi-client access, plus a **VS Code extension** for IDE-integrated chat. Fully self-hosted, no API keys.
 
 ## How It Works
 
 1. **Model discovery** — ollama-chain queries Ollama at startup and sorts all available models by parameter count
-2. **Web search** — DuckDuckGo fetches live context for the query (no API key needed)
+2. **Multi-source search** — DuckDuckGo, GitHub, Stack Overflow, and trusted documentation sites are searched in parallel (no API keys needed)
 3. **Cascade** — the query flows through every model from smallest to largest:
    - Smallest model drafts the initial answer with search context
    - Each intermediate model reviews, corrects errors, and strengthens citations
@@ -15,7 +19,11 @@ Chain **all** local Ollama models together with web search for maximum answer ac
 ```
 User query
     │
-    ├── DuckDuckGo web search (context gathering)
+    ├── Multi-source search (parallel):
+    │     ├── DuckDuckGo (general web)
+    │     ├── GitHub (repos + issues)
+    │     ├── Stack Overflow (Q&A)
+    │     └── Trusted docs (site-scoped)
     │
     ├── Model 1 (smallest) ──→ initial draft + sources
     ├── Model 2 ──→ review, correct, refine
@@ -29,14 +37,15 @@ User query
 - Python 3.11+
 - At least one pulled Ollama model (more models = more refinement stages)
 - Internet connection for web search (optional — use `--no-search` for offline mode)
-- `tcpdump` or `tshark` for generating .pcap files (optional)
+- `tcpdump` or `tshark` for generating .pcap files (optional, pcap mode)
+- `oc` (OpenShift CLI) or `kubectl` for Kubernetes/OpenShift cluster analysis (optional, k8s mode)
 
 ## Installation
 
 ```bash
 git clone https://github.com/midu16/ollama-chain.git
 cd ollama-chain
-pip install -r requirements.txt
+pip install .
 ```
 
 Verify Ollama is running:
@@ -86,6 +95,10 @@ python -m ollama_chain -m verify "How does DNS resolution work?"
 python -m ollama_chain -m fast "Quick: what port does HTTPS use?"
 python -m ollama_chain -m strong "Derive the time complexity of Dijkstra's algorithm"
 
+# Kubernetes / OpenShift cluster analysis (CLI only)
+python -m ollama_chain -m k8s --kubeconfig ~/.kube/config "What is the cluster health?"
+python -m ollama_chain -m k8s --kubeconfig /tmp/ocp.kubeconfig "Why are pods crashing?"
+
 # Fully offline (no web search)
 python -m ollama_chain --no-search "What is a linked list?"
 
@@ -99,19 +112,20 @@ python -m ollama_chain --clear-memory
 
 ## Chaining Modes
 
-| Mode | Pipeline | Best For |
-|---|---|---|
-| `cascade` | ALL models chain smallest→largest, each refining (default) | Maximum accuracy |
-| `auto` | Router classifies complexity, picks optimal strategy automatically | Adaptive routing |
-| `consensus` | All models answer independently, strongest merges | Reducing model bias |
-| `route` | Fast classifies complexity (1-5), routes to fast or strong | Quick simple queries |
-| `pipeline` | Fast extracts + classifies domain, strong reasons | Long/complex input |
-| `verify` | Fast drafts, strong verifies and corrects | Fact-checking |
-| `search` | Search first, strong synthesizes from results | Time-sensitive queries |
-| `agent` | Autonomous agent with planning, memory, tools, and control flow | Multi-step tasks |
-| `pcap` | Scapy parses → models analyze → expert report | Network analysis |
-| `fast` | Direct to smallest model | Speed |
-| `strong` | Direct to largest model | Single-model quality |
+| Mode | Pipeline | Best For | Availability |
+|---|---|---|---|
+| `cascade` | ALL models chain smallest→largest, each refining (default) | Maximum accuracy | CLI, API, Extension |
+| `auto` | Router classifies complexity, picks optimal strategy automatically | Adaptive routing | CLI, API, Extension |
+| `consensus` | All models answer independently, strongest merges | Reducing model bias | CLI, API, Extension |
+| `route` | Fast classifies complexity (1-5), routes to fast or strong | Quick simple queries | CLI, API, Extension |
+| `pipeline` | Fast extracts + classifies domain, strong reasons | Long/complex input | CLI, API, Extension |
+| `verify` | Fast drafts, strong verifies and corrects | Fact-checking | CLI, API, Extension |
+| `search` | Search first, strong synthesizes from results | Time-sensitive queries | CLI, API, Extension |
+| `agent` | Autonomous agent with planning, memory, tools, and control flow | Multi-step tasks | CLI, API, Extension |
+| `pcap` | Scapy parses → models analyze → expert report | Network analysis | **CLI only** |
+| `k8s` | oc/kubectl gathers cluster state → models produce expert report | Cluster analysis | **CLI only** |
+| `fast` | Direct to smallest model | Speed | CLI, API, Extension |
+| `strong` | Direct to largest model | Single-model quality | CLI, API, Extension |
 
 ## Autonomous Agent
 
@@ -212,6 +226,9 @@ The agent interacts with the environment through a registry of tools:
 | `list_dir` | List directory contents |
 | `web_search` | Search the web via DuckDuckGo |
 | `web_search_news` | Search recent news articles |
+| `github_search` | Search GitHub repositories and issues |
+| `stackoverflow_search` | Search Stack Overflow Q&A |
+| `docs_search` | Search trusted documentation sites (kubernetes.io, MDN, Red Hat, etc.) |
 | `python_eval` | Evaluate Python expressions (math, string ops, list comprehensions) |
 
 When the LLM is available, it chooses the tool and constructs the arguments. When all models are unavailable (e.g. transient Ollama errors), the agent **auto-executes tools directly from plan hints** — extracting quoted commands from step descriptions, applying heuristics for common tasks (OS detection, package listing), and building search queries from discovered facts. This means the agent can complete data-gathering steps even during model outages.
@@ -370,18 +387,66 @@ The `validation.py` module provides functions to validate plan steps and model s
 - `validate_plan()` — validates an entire plan for duplicate IDs, dangling dependencies, and invalid tools
 - `validate_model_sequence()` — checks for empty or duplicate model lists
 
+## Selective Thinking & Temperature Control
+
+ollama-chain dynamically applies chain-of-thought ("thinking") to models that support it, based on query complexity and chain stage. This maximizes accuracy on hard questions without wasting cycles on trivial ones.
+
+### How It Works
+
+1. **Model capability detection** — `model_supports_thinking()` queries `ollama.show()` for `capabilities: ["thinking"]`. Results are cached per-model. Falls back to name-based heuristics (qwen3, deepseek-r1, qwq) if the API call fails.
+2. **Selective activation** — thinking is applied per-stage based on complexity:
+
+| Complexity | Draft stage | Review stages | Final answer |
+|---|---|---|---|
+| `simple` | No thinking | No thinking | No thinking |
+| `moderate` | No thinking | No thinking | **Thinking ON** |
+| `complex` | No thinking | **Thinking ON** | **Thinking ON** |
+
+3. **`/no_think` directive** — for models that support thinking, `/no_think` is prepended to prompts where thinking is intentionally disabled. Models without thinking capability receive the prompt unmodified.
+4. **`<think>` tag stripping** — any `<think>...</think>` blocks in model responses are automatically stripped, so only the clean answer is returned.
+
+### Temperature Control
+
+Low temperatures are used in accuracy-critical stages to encourage deterministic, factual responses:
+
+| Stage | Temperature | Purpose |
+|---|---|---|
+| Draft / data-gathering | default (model default) | Creative initial exploration |
+| Review / verification | `0.4` | Focused error correction |
+| Final answer / synthesis | `0.3` | Maximum factual precision |
+
+### Per-Mode Thinking
+
+| Mode | Thinking stages |
+|---|---|
+| `cascade` | Complexity-driven (see table above) |
+| `auto` | Propagates complexity to cascade |
+| `route` | Final answer for complex queries |
+| `pipeline` | Final reasoning step |
+| `verify` | Verification + final |
+| `consensus` | Individual answers (if capable) + final merge |
+| `search` | Final synthesis |
+| `strong` | Always on |
+| `agent` | Reasoning steps (non-simple) + final synthesis |
+| `pcap` | Expert report |
+| `k8s` | Expert report |
+
 ## Resilience
 
 All Ollama calls across every mode (cascade, agent, search, planning) use automatic retry with exponential backoff on transient errors:
 
 - **Retries** — up to 3 attempts per model with 2s/4s/8s delays
 - **Model fallback** (agent mode) — if the strongest model is unavailable, the agent tries progressively smaller models before falling back to auto-execution
-- **`keep_alive`** — models are kept loaded for 10 minutes to avoid repeated load/unload cycles during multi-step operations
+- **`keep_alive`** — models are kept loaded for 15 minutes (`_DEFAULT_KEEP_ALIVE = "15m"`) to avoid repeated load/unload cycles during multi-step operations, especially important for CPU-bound inference
 
 ## Source Citations
 
-All modes instruct models to cite authoritative sources using this format:
+Every answer — regardless of mode — includes a **## Sources** section at the end listing all referenced sources. This is enforced at two levels:
 
+1. **Prompt guidance** — all modes instruct models to cite sources inline and include a mandatory `## Sources` section
+2. **Post-processing** — if the model omits the Sources section, a lightweight follow-up LLM call automatically appends one
+
+Inline citation format:
 ```
 [Source: IETF RFC 793, https://www.rfc-editor.org/rfc/rfc793]
 [Source: Red Hat Documentation, https://docs.redhat.com/...]
@@ -391,19 +456,81 @@ All modes instruct models to cite authoritative sources using this format:
 Prioritized source categories:
 - **Standards bodies** — IETF RFCs, IEEE, ISO, NIST, W3C
 - **Official documentation** — Red Hat, kernel.org, Mozilla MDN, Microsoft Docs
-- **Vendor/project docs** — PostgreSQL docs, Nginx docs, etc.
+- **Vendor/project docs** — PostgreSQL docs, Nginx docs, kubernetes.io, docs.openshift.com, etc.
 - **Peer-reviewed work** — academic papers, published research
 
 Models are instructed to mark claims as unverified when no authoritative source can be referenced.
 
-## Web Search
+## Web Search (Multi-Source)
 
-All modes include web search by default (via DuckDuckGo, no API key):
+All modes include web search by default. Results are gathered from **multiple trusted sources in parallel** — no API keys required:
+
+| Source | Provider | What it searches |
+|---|---|---|
+| **Web** | DuckDuckGo | General web results |
+| **GitHub** | GitHub REST API | Repositories (by stars) and issues/discussions |
+| **Stack Overflow** | Stack Exchange API | Programming Q&A with votes and answer counts |
+| **Official Docs** | DuckDuckGo (site-scoped) | Trusted documentation sites only |
+| **News** | DuckDuckGo News | Recent/time-sensitive articles |
+
+### Search Pipeline
 
 1. Fast model generates 1-3 optimized search queries
-2. DuckDuckGo executes them, results are deduplicated
-3. Results are injected as context alongside source-citation instructions
-4. Models cross-reference their knowledge against live search results
+2. All providers searched **in parallel** (ThreadPoolExecutor):
+   - DuckDuckGo web search (general)
+   - GitHub repository search
+   - GitHub issue/discussion search
+   - Stack Overflow Q&A search
+   - Trusted documentation site search (site-scoped DuckDuckGo)
+3. Results aggregated, deduplicated by URL, and tagged by source
+4. Models cross-reference their knowledge against multi-source results
+
+### Trusted Documentation Domains
+
+The docs search provider scopes queries to these authoritative sites:
+
+`kubernetes.io` · `docs.openshift.com` · `docs.redhat.com` · `kernel.org` ·
+`developer.mozilla.org` (MDN) · `docs.python.org` · `rfc-editor.org` · `w3.org` ·
+`docs.docker.com` · `learn.microsoft.com` · `wiki.archlinux.org` · `man7.org` ·
+`nginx.org` · `postgresql.org` · `go.dev` · `rust-lang.org` · `cppreference.com`
+
+### Search Tool Fallbacks
+
+When a search provider fails, the agent automatically tries alternatives:
+
+| Tool | Fallbacks |
+|---|---|
+| `web_search` | `web_search_news` → `docs_search` |
+| `github_search` | `web_search` |
+| `stackoverflow_search` | `web_search` |
+| `docs_search` | `web_search` |
+
+### Example Search Output
+
+```
+[search] Generating search queries with qwen3:14b...
+[search] Searching: ['TCP congestion control algorithms', 'TCP CUBIC vs BBR']
+[search] Found 18 results (GitHub: 3, Official Docs: 4, Stack Overflow: 3, Web: 8)
+```
+
+Each result is tagged with its source for LLM context:
+```
+[1] [Web] TCP Congestion Control - Wikipedia
+    https://en.wikipedia.org/wiki/TCP_congestion_control
+    TCP uses a number of mechanisms to achieve high performance...
+
+[2] [GitHub] google/bbr
+    https://github.com/google/bbr
+    BBR congestion control  [★3200 | C]
+
+[3] [Stack Overflow] What is the difference between TCP CUBIC and BBR?
+    https://stackoverflow.com/questions/...
+    Score: 45 | Answers: 3 ✓ | Tags: tcp, networking, congestion-control
+
+[4] [Official Docs] TCP Congestion Control - kernel.org
+    https://www.kernel.org/doc/html/latest/networking/...
+    The Linux kernel supports multiple TCP congestion control algorithms...
+```
 
 Use `--no-search` for fully offline operation.
 
@@ -437,6 +564,235 @@ python -m ollama_chain -m pcap --pcap /tmp/capture.pcap "Why are there so many R
 python -m ollama_chain --no-search -m pcap --pcap /tmp/capture.pcap
 ```
 
+## Kubernetes / OpenShift Analysis (CLI only)
+
+Analyze Kubernetes and OpenShift clusters using a kubeconfig file:
+
+1. **oc/kubectl** gathers comprehensive cluster state (nodes, pods, deployments, services, events, storage, operators)
+2. **Web search** finds troubleshooting context for detected issues
+3. **Fast model** summarizes findings and classifies issues by severity
+4. **Strong model** produces expert report with official documentation references
+
+### What It Collects
+
+- Cluster version and platform (vanilla K8s vs OpenShift)
+- Nodes (status, roles, capacity, labels)
+- Pods (all namespaces, unhealthy pod detection)
+- Deployments and replica status
+- Services and networking (Ingresses, Routes for OpenShift)
+- Warning events (sorted by timestamp)
+- Storage (PersistentVolumes, StorageClasses)
+- Resource usage (CPU/memory via metrics-server, if available)
+- OpenShift-specific: ClusterOperators, Machines, MachineConfigPools, installed operators (CSV), infrastructure config
+
+### Issue Detection
+
+- Degraded or unavailable ClusterOperators (OpenShift)
+- Unhealthy pods (CrashLoopBackOff, Pending, Failed)
+- High warning event volume
+- Capacity and resource utilization concerns
+
+### K8s Usage
+
+```bash
+# Basic cluster health report
+python -m ollama_chain -m k8s --kubeconfig ~/.kube/config
+
+# Ask specific questions about the cluster
+python -m ollama_chain -m k8s --kubeconfig ~/.kube/config "Why are pods crashing in namespace foo?"
+python -m ollama_chain -m k8s --kubeconfig /tmp/ocp.kubeconfig "Show cluster operator status"
+python -m ollama_chain -m k8s --kubeconfig ~/.kube/config "Is the cluster healthy for production?"
+
+# Without web search
+python -m ollama_chain --no-search -m k8s --kubeconfig ~/.kube/config "Summarize the cluster"
+```
+
+> **Note:** The k8s mode uses `oc` (preferred) or `kubectl`, whichever is available in PATH. It performs **read-only** operations — no cluster state is modified.
+
+## API Server
+
+The API server (v0.7) provides an HTTP interface to ollama-chain with a **memory-aware scheduler** that queues prompts and prevents OOM when multiple clients send requests concurrently. Each prompt is executed as an isolated subprocess, and results are streamed back via Server-Sent Events (SSE).
+
+### Starting the Server
+
+```bash
+# Default: listen on 127.0.0.1:8585, max 1 concurrent chain
+ollama-chain-server
+
+# Custom host/port
+ollama-chain-server --host 0.0.0.0 --port 9090
+
+# Allow 2 concurrent chains (requires sufficient RAM/VRAM)
+ollama-chain-server --max-concurrent 2
+
+# Increase per-job timeout to 15 minutes (default: 600s / 10 min)
+ollama-chain-server --job-timeout 900
+
+# Custom log directory
+ollama-chain-server --log-dir /var/log/ollama-chain
+```
+
+### Logging
+
+All server activity is logged to `.logs/ollama-chain-server.log` at **DEBUG** level for troubleshooting. A summary INFO stream is also printed to stderr.
+
+| Component | What is logged |
+|---|---|
+| **HTTP requests** | Method, path, remote IP, status code, latency (ms) |
+| **Prompt submission** | Mode, web_search flag, prompt preview, job ID |
+| **Job lifecycle** | Queued, running, completed, failed, cancelled transitions |
+| **Subprocess** | Command args, PID, stderr progress lines, return code |
+| **Memory gating** | Available memory ratio, wait events |
+| **Errors** | Full tracebacks for unhandled exceptions |
+
+```bash
+# View live logs
+tail -f .logs/ollama-chain-server.log
+
+# Search for errors
+grep ERROR .logs/ollama-chain-server.log
+
+# Filter by job ID
+grep "abc123def456" .logs/ollama-chain-server.log
+```
+
+Log format: `YYYY-MM-DD HH:MM:SS  LEVEL     module  message`
+
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/prompt` | Submit a prompt — returns `{job_id, status, position}` |
+| `GET` | `/api/prompt/{job_id}/stream` | SSE stream of progress events + final result |
+| `GET` | `/api/prompt/{job_id}` | Poll job status and result |
+| `DELETE` | `/api/prompt/{job_id}` | Cancel a queued or running job |
+| `GET` | `/api/models` | List available Ollama models |
+| `GET` | `/api/health` | Health check with queue stats |
+
+### Submitting a Prompt
+
+```bash
+# Submit (timeout defaults to server's --job-timeout, or specify per-request)
+curl -X POST http://localhost:8585/api/prompt \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "What is TCP?", "mode": "cascade", "web_search": true, "timeout": 600}'
+
+# Response: {"job_id": "a1b2c3d4e5f6", "status": "queued", "position": 0}
+
+# Stream results (SSE — includes periodic keepalive comments)
+curl -N http://localhost:8585/api/prompt/a1b2c3d4e5f6/stream
+
+# Cancel
+curl -X DELETE http://localhost:8585/api/prompt/a1b2c3d4e5f6
+```
+
+### SSE Event Types
+
+| Event | Data | When |
+|---|---|---|
+| `queued` | `{position}` | Job is waiting in the queue |
+| `progress` | `{line}` | Chain execution progress (model stages, search) |
+| `complete` | `{result}` | Final answer text |
+| `timed_out` | `{error, partial_result}` | Job exceeded its timeout; partial result may be included |
+| `error` | `{error}` | Chain execution failed |
+| `cancelled` | `{}` | Job was cancelled |
+| `: keepalive` | (SSE comment) | Heartbeat sent every 15s to keep the connection alive |
+
+### Timeout & Keepalive
+
+Each job has a configurable timeout (default: 600s / 10 minutes). The server enforces it at the subprocess level — when a chain exceeds its limit, the subprocess is killed and any partial output produced so far is returned alongside a `timed_out` event.
+
+**Per-request timeout**: clients can set a `timeout` field (in seconds) in the `POST /api/prompt` body to override the server default (capped at 3600s):
+
+```bash
+curl -X POST http://localhost:8585/api/prompt \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "Complex analysis...", "mode": "cascade", "timeout": 900}'
+```
+
+**SSE heartbeat**: the server sends `: keepalive <elapsed>s` comments every 15 seconds on idle SSE streams. This prevents proxies, load balancers, and client socket timeouts from dropping long-running connections. The VS Code extension uses these heartbeats to reset its idle timer, and falls back to polling if no data arrives within 2 minutes.
+
+### Memory-Aware Scheduling
+
+The scheduler checks `/proc/meminfo` before dequeuing each job. If available system memory drops below 10% of total, the scheduler pauses and waits for resources to free up. Combined with the default `max_concurrent=1`, this prevents concurrent chain executions from exhausting system memory when Ollama loads large models.
+
+## VS Code Extension
+
+The VS Code extension (v0.5) provides an IDE-integrated chat UI for ollama-chain. It connects exclusively to the API server for prompt execution — the API server must be running.
+
+### Features
+
+- Webview chat panel with markdown rendering and code block actions (copy, insert at cursor)
+- Mode selector for all chain modes (cascade, auto, agent, etc.)
+- Real-time progress display via SSE streaming from the API server
+- Cancel support for running/queued jobs
+- Session preservation — the webview retains context even when hidden, with SSE reconnection and polling fallback to keep sessions alive until the answer arrives
+- Queue position indicator when multiple prompts are pending
+- Elapsed time indicator during active sessions
+
+### Setup
+
+1. Start the API server: `ollama-chain-server`
+2. Open VS Code, find "Ollama Chain" in the activity bar (llama + bee icon)
+3. Configure `ollamaChain.apiUrl` if the server runs on a non-default address
+
+### Configuration
+
+| Setting | Default | Description |
+|---|---|---|
+| `ollamaChain.mode` | `cascade` | Default chain mode |
+| `ollamaChain.webSearch` | `true` | Enable web search context |
+| `ollamaChain.maxIterations` | `15` | Agent mode iteration budget |
+| `ollamaChain.apiUrl` | `http://localhost:8585` | API server URL |
+| `ollamaChain.timeout` | `600` | Per-job timeout in seconds (sent to server, which kills the subprocess after this duration) |
+
+### Connection Flow
+
+The extension communicates exclusively with the ollama-chain API server:
+
+1. Checks API availability via `GET /api/health`
+2. Submits prompts via `POST /api/prompt` (including the configured `timeout`)
+3. Streams progress and results via SSE (`GET /api/prompt/{job_id}/stream`)
+4. Resets an idle timer on every received chunk (including server heartbeats) — idle connections trigger SSE reconnection after 2 minutes of silence, not a hard error
+5. Falls back to polling (`GET /api/prompt/{job_id}`) if SSE reconnection is exhausted (up to 600 poll attempts at 2s intervals = 20 minutes)
+6. Handles `timed_out` events gracefully — displays partial results when available
+
+If the API server is not running, the extension displays an error with instructions to start it.
+
+## Makefile
+
+All common tasks are available via `make`:
+
+```bash
+make help            # Show all targets with descriptions
+make install         # Install runtime deps + editable package
+make install-dev     # Install runtime + dev deps (pytest, pytest-asyncio, pytest-aiohttp)
+make test            # Run full test suite (538 tests)
+make test-quick      # Run tests without verbose output
+make lint            # Syntax-check all Python source files
+make server          # Start the API server (default: 127.0.0.1:8585)
+
+# Run individual modes
+make run-cascade QUERY="your question"
+make run-auto QUERY="your question"
+make run-agent AGENT_GOAL="your goal" MAX_ITER=20
+make run-pcap PCAP_FILE=/tmp/capture.pcap
+make run-k8s KUBECONFIG=~/.kube/config
+
+# Utilities
+make list-models
+make show-memory
+make clear-memory
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `QUERY` | `"What is TCP congestion control..."` | Query for chaining modes |
+| `AGENT_GOAL` | `"Identify my OS..."` | Goal for agent mode |
+| `MAX_ITER` | `15` | Agent max iterations |
+| `PCAP_FILE` | `capture.pcap` | PCAP file for pcap mode |
+| `KUBECONFIG` | `~/.kube/config` | Kubeconfig file for k8s mode |
+
 ## Auto Model Discovery
 
 All models are used by default, sorted by parameter count:
@@ -466,8 +822,7 @@ $ python -m ollama_chain -m cascade "What port does SSH use?"
 Models (3): qwen3:14b → qwen3:32b → qwen3-coder-next:latest | Web search: on
 [search] Generating search queries with qwen3:14b...
 [search] Searching: ['What port does SSH use', 'default port for SSH', 'SSH port number']
-Impersonate 'safari_17.2.1' does not exist, using 'random'
-[search] Found 10 results
+[search] Found 16 results (GitHub: 3, Official Docs: 3, Stack Overflow: 3, Web: 7)
 [cascade 1/3] Drafting with qwen3:14b...
 [cascade 2/3] Reviewing with qwen3:32b...
 [cascade 3/3] Final answer with qwen3-coder-next:latest...
@@ -490,6 +845,8 @@ ollama-chain/
 │   ├── __init__.py
 │   ├── __main__.py      # python -m ollama_chain entry point
 │   ├── cli.py           # CLI argument parsing and dispatch
+│   ├── server.py        # HTTP API server (aiohttp + CORS + SSE streaming)
+│   ├── scheduler.py     # Memory-aware async job scheduler (subprocess isolation)
 │   ├── common.py        # Shared utilities (ask, retry, message sanitization)
 │   ├── models.py        # Ollama model discovery and ordering
 │   ├── router.py        # Query routing, complexity classification, fallback chains
@@ -497,18 +854,44 @@ ollama-chain/
 │   ├── agent.py         # Autonomous agent (planning, tools, control flow)
 │   ├── planner.py       # LLM-driven goal decomposition and re-planning
 │   ├── memory.py        # Session + persistent memory (~/.ollama_chain/)
-│   ├── tools.py         # Tool registry (shell, files, search, python_eval)
+│   ├── tools.py         # Tool registry (shell, files, multi-source search, python_eval)
 │   ├── validation.py    # Plan and model sequence validation
-│   ├── search.py        # DuckDuckGo web search (no API key)
-│   └── pcap.py          # PCAP parsing and analysis with scapy
-├── tests/
-│   ├── test_agent.py    # Agent helper tests
+│   ├── search.py        # Multi-source search (DuckDuckGo, GitHub, Stack Overflow, docs)
+│   ├── metrics.py       # Prompt quality metrics (9 heuristic dimensions)
+│   ├── optimizer.py     # LLM-driven prompt rewriting
+│   ├── pcap.py          # PCAP parsing and analysis with scapy (CLI only)
+│   └── k8s.py           # Kubernetes/OpenShift cluster analysis (CLI only)
+├── ollama-chain-vscode-extension/
+│   ├── src/
+│   │   ├── extension.ts          # Extension activation + command registration
+│   │   ├── ChatViewProvider.ts   # Webview chat panel (API-only)
+│   │   └── OllamaChainRunner.ts  # API client (SSE + polling fallback)
+│   ├── resources/
+│   │   ├── icon.svg              # Extension icon (llama + bee)
+│   │   └── webview.js            # Chat UI logic
+│   ├── package.json              # Extension manifest + configuration schema
+│   └── tsconfig.json
+├── tests/                      # 538 tests (18 files)
+│   ├── test_agent.py           # Agent helper tests
 │   ├── test_cascade_errors.py  # Cascade error handling + auto mode tests
-│   ├── test_memory.py   # Memory system tests
-│   ├── test_planner.py  # Planner tests
-│   ├── test_router.py   # Router classification, routing, fallback tests
-│   ├── test_tools.py    # Tool registry tests
-│   └── test_validation.py  # Validation tests
+│   ├── test_chains_modes.py    # Chain modes: selective thinking + temperature
+│   ├── test_cli.py             # CLI argument parsing, pcap path detection
+│   ├── test_common.py          # ask(), chat_with_retry(), model_supports_thinking
+│   ├── test_k8s.py             # K8s/OCP analysis, format_analysis, issue detection
+│   ├── test_memory.py          # Memory system tests
+│   ├── test_metrics.py         # Prompt quality metrics
+│   ├── test_models.py          # Model discovery, pick_models, memory eviction
+│   ├── test_optimizer.py       # Prompt rewriting
+│   ├── test_pcap.py            # PCAP analysis, port classification, format_analysis
+│   ├── test_planner.py         # Planner tests
+│   ├── test_router.py          # Router classification, routing, fallback tests
+│   ├── test_scheduler.py       # Job lifecycle, queue positions, cancellation
+│   ├── test_search.py          # Multi-source search (DDG, GitHub, SO, docs)
+│   ├── test_server.py          # API endpoints, CORS, SSE, CLI-only rejection
+│   ├── test_tools.py           # Tool registry tests
+│   └── test_validation.py      # Validation tests
+├── .logs/                      # Server logs (auto-created, git-ignored)
+│   └── ollama-chain-server.log # DEBUG-level server log
 ├── architecture.excalidraw  # Architecture diagram
 ├── pyproject.toml
 ├── requirements.txt

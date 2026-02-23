@@ -2,10 +2,17 @@
 
 import sys
 
-from .common import SOURCE_GUIDANCE, ask
-from .pcap import analyze_pcap, format_analysis
+from .common import SOURCE_GUIDANCE, ask, model_supports_thinking
+from .pcap import analyze_pcap, format_analysis as format_pcap_analysis
+from .k8s import analyze_cluster, format_analysis as format_k8s_analysis
 from .router import build_fallback_chain, route_query
 from .search import search_for_query
+
+CLI_ONLY_MODES = frozenset({"pcap", "k8s"})
+
+# Temperature presets for accuracy-critical stages
+_TEMP_REVIEW = 0.4
+_TEMP_FINAL = 0.3
 
 
 def _enrich_with_search(query: str, fast: str, web_search: bool) -> str:
@@ -16,7 +23,7 @@ def _enrich_with_search(query: str, fast: str, web_search: bool) -> str:
     if not results:
         return ""
     return (
-        f"\n\n=== WEB SEARCH RESULTS ===\n"
+        f"\n\n=== SEARCH RESULTS (Web, GitHub, Stack Overflow, Docs) ===\n"
         f"Use these as reference to improve accuracy. Cite sources when relevant.\n\n"
         f"{results}"
     )
@@ -36,6 +43,7 @@ def _inject_search_context(prompt: str, search_context: str) -> str:
 def chain_cascade(
     query: str, all_models: list[str], *,
     web_search: bool = True, fast: str | None = None,
+    complexity: str | None = None,
 ) -> str:
     """
     Progressive refinement through every available model:
@@ -43,6 +51,11 @@ def chain_cascade(
       2. Smallest model produces initial draft
       3. Each subsequent model reviews, corrects, and refines
       4. Largest model produces the final authoritative answer
+
+    Thinking is engaged selectively based on *complexity*:
+      - simple  → no thinking anywhere (speed priority)
+      - moderate → thinking on final answer only
+      - complex / None → thinking on review + final stages
 
     Error handling: if an intermediate model fails (all retries exhausted),
     it is skipped and the cascade continues.  If the draft or final model
@@ -53,7 +66,10 @@ def chain_cascade(
     n = len(all_models)
     skipped: list[str] = []
 
-    # --- Stage 1: first model drafts ---
+    review_think = complexity not in ("simple", "moderate")
+    final_think = complexity != "simple"
+
+    # --- Stage 1: first model drafts (never thinks — speed matters) ---
     draft_prompt = (
         f"{SOURCE_GUIDANCE}\n\n"
         f"Answer the following question thoroughly and accurately.\n\n"
@@ -91,8 +107,12 @@ def chain_cascade(
     review_models = [
         m for m in all_models[1:-1] if m not in skipped
     ]
+    think_label = " +think" if review_think else ""
     for i, model in enumerate(review_models, start=2):
-        print(f"[cascade {i}/{n}] Reviewing with {model}...", file=sys.stderr)
+        print(
+            f"[cascade {i}/{n}] Reviewing with {model}{think_label}...",
+            file=sys.stderr,
+        )
         try:
             current_answer = ask(
                 f"You are a reviewer improving the accuracy of an answer.\n"
@@ -109,7 +129,8 @@ def chain_cascade(
                 f"Output ONLY the improved answer, not a commentary on the changes."
                 + (f"\n{search_ctx}" if search_ctx else ""),
                 model=model,
-                thinking=True,
+                thinking=review_think,
+                temperature=_TEMP_REVIEW if review_think else None,
             )
         except Exception as e:
             print(
@@ -140,15 +161,20 @@ def chain_cascade(
     final_models = [all_models[-1]] + build_fallback_chain(
         all_models, all_models[-1],
     )
+    think_label = " +think" if final_think else ""
     for final_model in final_models:
         if final_model in skipped:
             continue
         print(
-            f"[cascade {n}/{n}] Final answer with {final_model}...",
+            f"[cascade {n}/{n}] Final answer with {final_model}{think_label}...",
             file=sys.stderr,
         )
         try:
-            result = ask(final_prompt, model=final_model, thinking=True)
+            result = ask(
+                final_prompt, model=final_model,
+                thinking=final_think,
+                temperature=_TEMP_FINAL if final_think else None,
+            )
             if skipped:
                 print(
                     f"[cascade] Completed with skipped models: {skipped}",
@@ -207,8 +233,8 @@ def chain_route(
         print(f"[route 2/2] Answering with {fast_name} (simple)...", file=sys.stderr)
         return ask(enriched, model=fast_name)
     else:
-        print(f"[route 2/2] Answering with {strong_name} (complex)...", file=sys.stderr)
-        return ask(enriched, model=strong_name, thinking=True)
+        print(f"[route 2/2] Answering with {strong_name} +think (complex)...", file=sys.stderr)
+        return ask(enriched, model=strong_name, thinking=True, temperature=_TEMP_FINAL)
 
 
 def chain_pipeline(
@@ -232,7 +258,7 @@ def chain_pipeline(
         model=fast_name,
     )
 
-    print(f"[pipeline 3/3] Deep analysis with {strong_name} ({domain.strip()})...", file=sys.stderr)
+    print(f"[pipeline 3/3] Deep analysis with {strong_name} +think ({domain.strip()})...", file=sys.stderr)
     prompt = (
         f"You are an expert in {domain}.\n"
         f"{SOURCE_GUIDANCE}\n\n"
@@ -240,7 +266,10 @@ def chain_pipeline(
         f"Original query: {query}\n\n"
         f"Provide a thorough, well-structured answer."
     )
-    return ask(_inject_search_context(prompt, search_ctx), model=strong_name, thinking=True)
+    return ask(
+        _inject_search_context(prompt, search_ctx), model=strong_name,
+        thinking=True, temperature=_TEMP_FINAL,
+    )
 
 
 def chain_verify(
@@ -255,7 +284,7 @@ def chain_verify(
     print(f"[verify 1/2] Drafting with {fast_name}...", file=sys.stderr)
     draft = ask(f"{SOURCE_GUIDANCE}\n\n{query}", model=fast_name)
 
-    print(f"[verify 2/2] Verifying with {strong_name}...", file=sys.stderr)
+    print(f"[verify 2/2] Verifying with {strong_name} +think...", file=sys.stderr)
     prompt = (
         f"Another model answered the following question. "
         f"Verify the answer for correctness, fix any errors, and improve it. "
@@ -264,7 +293,10 @@ def chain_verify(
         f"Question: {query}\n\n"
         f"Draft answer:\n{draft}"
     )
-    return ask(_inject_search_context(prompt, search_ctx), model=strong_name, thinking=True)
+    return ask(
+        _inject_search_context(prompt, search_ctx), model=strong_name,
+        thinking=True, temperature=_TEMP_REVIEW,
+    )
 
 
 def chain_consensus(
@@ -279,8 +311,12 @@ def chain_consensus(
     sourced_query = f"{SOURCE_GUIDANCE}\n\n{query}"
     answers = []
     for i, model in enumerate(all_models, 1):
-        print(f"[consensus {i}/{len(all_models) + 1}] Answer from {model}...", file=sys.stderr)
-        use_thinking = (model == strong_name)
+        use_thinking = model_supports_thinking(model) and model != fast_name
+        label = " +think" if use_thinking else ""
+        print(
+            f"[consensus {i}/{len(all_models) + 1}] Answer from {model}{label}...",
+            file=sys.stderr,
+        )
         answers.append((model, ask(sourced_query, model=model, thinking=use_thinking)))
 
     answers_block = "\n\n".join(
@@ -290,7 +326,7 @@ def chain_consensus(
 
     print(
         f"[consensus {len(all_models) + 1}/{len(all_models) + 1}] "
-        f"Merging with {strong_name}...",
+        f"Merging with {strong_name} +think...",
         file=sys.stderr,
     )
     prompt = (
@@ -302,7 +338,10 @@ def chain_consensus(
         f"Question: {query}\n\n"
         f"{answers_block}"
     )
-    return ask(_inject_search_context(prompt, search_ctx), model=strong_name, thinking=True)
+    return ask(
+        _inject_search_context(prompt, search_ctx), model=strong_name,
+        thinking=True, temperature=_TEMP_FINAL,
+    )
 
 
 def chain_search(
@@ -315,10 +354,13 @@ def chain_search(
     results = search_for_query(query, fast_name)
 
     if not results:
-        print("[search] No results found, falling back to strong model...", file=sys.stderr)
-        return ask(f"{SOURCE_GUIDANCE}\n\n{query}", model=strong_name, thinking=True)
+        print("[search] No results found, falling back to strong model +think...", file=sys.stderr)
+        return ask(
+            f"{SOURCE_GUIDANCE}\n\n{query}", model=strong_name,
+            thinking=True, temperature=_TEMP_FINAL,
+        )
 
-    print(f"[search] Synthesizing answer with {strong_name}...", file=sys.stderr)
+    print(f"[search] Synthesizing answer with {strong_name} +think...", file=sys.stderr)
     return ask(
         f"Answer the following question using the web search results below. "
         f"Be accurate, cite sources by number and include their URLs. "
@@ -327,9 +369,10 @@ def chain_search(
         f"Clearly state if the search results don't fully answer the question.\n"
         f"{SOURCE_GUIDANCE}\n\n"
         f"Question: {query}\n\n"
-        f"=== WEB SEARCH RESULTS ===\n{results}",
+        f"=== SEARCH RESULTS ===\n{results}",
         model=strong_name,
         thinking=True,
+        temperature=_TEMP_FINAL,
     )
 
 
@@ -355,11 +398,12 @@ def chain_strong(
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
     search_ctx = _enrich_with_search(query, fast_name, web_search)
-    print(f"[strong 1/1] {strong_name}...", file=sys.stderr)
+    print(f"[strong 1/1] {strong_name} +think...", file=sys.stderr)
     return ask(
         _inject_search_context(f"{SOURCE_GUIDANCE}\n\n{query}", search_ctx),
         model=strong_name,
         thinking=True,
+        temperature=_TEMP_FINAL,
     )
 
 
@@ -382,7 +426,7 @@ def chain_pcap(
 
     print(f"[pcap 1/4] Parsing {filepath} with scapy...", file=sys.stderr)
     analysis = analyze_pcap(filepath)
-    report = format_analysis(analysis)
+    report = format_pcap_analysis(analysis)
     print(
         f"[pcap 1/4] Parsed {analysis.total_packets} packets, "
         f"{len(analysis.errors)} errors detected",
@@ -437,7 +481,7 @@ def chain_pcap(
             f"Make sure to address their question directly.\n"
         )
 
-    print(f"[pcap 4/4] Expert report with {strong_name}...", file=sys.stderr)
+    print(f"[pcap 4/4] Expert report with {strong_name} +think...", file=sys.stderr)
     prompt = (
         f"You are a senior network engineer and security analyst. "
         f"Produce a comprehensive report for this packet capture.\n"
@@ -456,7 +500,120 @@ def chain_pcap(
         f"5. Security Observations\n"
         f"6. Recommendations\n"
     )
-    return ask(_inject_search_context(prompt, search_ctx), model=strong_name, thinking=True)
+    return ask(
+        _inject_search_context(prompt, search_ctx), model=strong_name,
+        thinking=True, temperature=_TEMP_FINAL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# K8S — Kubernetes / OpenShift cluster analysis (CLI only)
+# ---------------------------------------------------------------------------
+
+def chain_k8s(
+    kubeconfig: str, all_models: list[str],
+    query: str | None = None, *, web_search: bool = True, fast: str | None = None,
+) -> str:
+    """
+    Analyze a Kubernetes / OpenShift cluster through a multi-stage pipeline:
+      1. Gather comprehensive cluster state via oc/kubectl
+      2. Fast model summarizes findings and flags issues
+      3. Fast model performs focused issue analysis
+      4. Strong model produces a detailed expert report with references
+    """
+    fast_name = fast or all_models[0]
+    strong_name = all_models[-1]
+
+    print(f"[k8s 1/4] Gathering cluster state from {kubeconfig}...", file=sys.stderr)
+    analysis = analyze_cluster(kubeconfig)
+    report = format_k8s_analysis(analysis)
+    platform = "OpenShift" if analysis.is_openshift else "Kubernetes"
+    print(
+        f"[k8s 1/4] {platform} cluster — "
+        f"{len(analysis.errors)} errors, {len(analysis.warnings)} warnings",
+        file=sys.stderr,
+    )
+
+    search_ctx = ""
+    if web_search and (analysis.errors or analysis.warnings):
+        search_terms: list[str] = []
+        for e in analysis.errors[:5]:
+            if "DEGRADED" in e:
+                op_name = e.split("'")[1] if "'" in e else ""
+                search_terms.append(
+                    f"OpenShift ClusterOperator {op_name} degraded troubleshooting"
+                )
+            elif "NOT AVAILABLE" in e:
+                op_name = e.split("'")[1] if "'" in e else ""
+                search_terms.append(
+                    f"OpenShift ClusterOperator {op_name} unavailable fix"
+                )
+        for w in analysis.warnings[:5]:
+            if "Unhealthy pod" in w:
+                search_terms.append("Kubernetes pod CrashLoopBackOff troubleshooting")
+                break
+        if search_terms:
+            search_query = " ".join(search_terms[:2])
+            search_ctx = _enrich_with_search(search_query, fast_name, True)
+
+    print(f"[k8s 2/4] Summarizing with {fast_name}...", file=sys.stderr)
+    summary = ask(
+        f"You are a Kubernetes / OpenShift platform engineer. "
+        f"Summarize this cluster state analysis. "
+        f"Highlight the most important findings, health issues, and capacity concerns. "
+        f"Be concise but thorough.\n\n{report}",
+        model=fast_name,
+    )
+
+    print(f"[k8s 3/4] Issue analysis with {fast_name}...", file=sys.stderr)
+    if analysis.errors or analysis.warnings:
+        issue_details = "\n".join(analysis.errors + analysis.warnings)
+        issue_section = ask(
+            f"You are a Kubernetes / OpenShift SRE specialist. "
+            f"Analyze these cluster issues. "
+            f"Classify each by severity (critical/high/medium/low). "
+            f"Explain root causes and suggest remediation steps. "
+            f"Reference official Kubernetes or OpenShift documentation where applicable.\n\n"
+            f"Issues:\n{issue_details}\n\n"
+            f"Full cluster state:\n{report[:4000]}",
+            model=fast_name,
+        )
+    else:
+        issue_section = "No errors or warnings were detected in the cluster."
+
+    user_context = ""
+    if query:
+        user_context = (
+            f"\n\nThe user specifically asked: {query}\n"
+            f"Make sure to address their question directly.\n"
+        )
+
+    print(f"[k8s 4/4] Expert report with {strong_name} +think...", file=sys.stderr)
+    prompt = (
+        f"You are a senior {platform} platform engineer and SRE specialist. "
+        f"Produce a comprehensive report for this cluster.\n"
+        f"{SOURCE_GUIDANCE}\n"
+        f"Reference official documentation: "
+        f"kubernetes.io, docs.openshift.com, Red Hat Knowledge Base, "
+        f"and relevant upstream project docs.\n\n"
+        f"=== RAW CLUSTER STATE ===\n{report}\n\n"
+        f"=== SUMMARY ===\n{summary}\n\n"
+        f"=== ISSUE ANALYSIS ===\n{issue_section}\n"
+        f"{user_context}\n"
+        f"Structure your report with these sections:\n"
+        f"1. Executive Summary\n"
+        f"2. Cluster Overview (platform, version, nodes, capacity)\n"
+        f"3. Workload Health (pods, deployments, replicas)\n"
+        f"4. Networking (services, routes/ingresses, DNS)\n"
+        f"5. Storage (PVs, storage classes, utilization)\n"
+        f"6. Issues & Anomalies (with severity and remediation)\n"
+        f"7. Security Observations\n"
+        f"8. Recommendations\n"
+    )
+    return ask(
+        _inject_search_context(prompt, search_ctx), model=strong_name,
+        thinking=True, temperature=_TEMP_FINAL,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -526,9 +683,11 @@ def chain_auto(
     if decision.strategy == "subset_cascade":
         return chain_cascade(
             query, decision.models, web_search=use_search, fast=fast,
+            complexity=decision.complexity,
         )
     return chain_cascade(
         query, all_models, web_search=use_search, fast=fast,
+        complexity=decision.complexity,
     )
 
 

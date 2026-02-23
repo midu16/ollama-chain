@@ -7,6 +7,7 @@ QUERY      ?= "What is TCP congestion control and how does it work?"
 AGENT_GOAL ?= "Identify my OS and kernel version, then find relevant security advisories"
 MAX_ITER   ?= 15
 PCAP_FILE  ?= capture.pcap
+KUBECONFIG ?= ~/.kube/config
 PACKAGE    := ollama_chain
 
 # ───────────────────────────────── help ─────────────────────────────────
@@ -29,6 +30,10 @@ help: ## Show this help
 	@grep -E '^run-' $(MAKEFILE_LIST) | \
 		awk -F ':|##' '{printf "  %-18s %s\n", $$1, $$NF}'
 	@echo ""
+	@echo "Server:"
+	@grep -E '^server' $(MAKEFILE_LIST) | \
+		awk -F ':|##' '{printf "  %-18s %s\n", $$1, $$NF}'
+	@echo ""
 	@echo "Utilities:"
 	@grep -E '^(list-models|show-memory|clear-memory)\b' $(MAKEFILE_LIST) | \
 		awk -F ':|##' '{printf "  %-18s %s\n", $$1, $$NF}'
@@ -38,6 +43,7 @@ help: ## Show this help
 	@echo '  AGENT_GOAL   Goal for agent mode  (default: "$(AGENT_GOAL)")'
 	@echo '  MAX_ITER     Agent max iterations (default: $(MAX_ITER))'
 	@echo '  PCAP_FILE    PCAP file for pcap mode (default: $(PCAP_FILE))'
+	@echo '  KUBECONFIG   Kubeconfig file for k8s mode (default: $(KUBECONFIG))'
 
 # ──────────────────────────── build & install ───────────────────────────
 
@@ -50,6 +56,7 @@ install: ## Install runtime dependencies and the package (editable)
 install-dev: ## Install runtime + dev dependencies (pytest, build)
 	$(PIP) install -r requirements.txt
 	$(PIP) install -e ".[dev]"
+	$(PIP) install pytest-asyncio pytest-aiohttp
 
 .PHONY: build
 build: ## Build distributable wheel and sdist
@@ -65,7 +72,7 @@ clean: ## Remove build artefacts, caches, eggs
 # ─────────────────────────── testing & lint ─────────────────────────────
 
 .PHONY: test
-test: ## Run the test suite with pytest
+test: ## Run the full test suite with pytest (538 tests)
 	$(PYTHON) -m pytest tests/ -v --tb=short
 
 .PHONY: test-quick
@@ -83,10 +90,17 @@ lint: ## Syntax-check all Python source files
 	@$(PYTHON) -m py_compile $(PACKAGE)/models.py
 	@$(PYTHON) -m py_compile $(PACKAGE)/search.py
 	@$(PYTHON) -m py_compile $(PACKAGE)/pcap.py
+	@$(PYTHON) -m py_compile $(PACKAGE)/k8s.py
 	@$(PYTHON) -m py_compile $(PACKAGE)/memory.py
 	@$(PYTHON) -m py_compile $(PACKAGE)/tools.py
 	@$(PYTHON) -m py_compile $(PACKAGE)/planner.py
 	@$(PYTHON) -m py_compile $(PACKAGE)/agent.py
+	@$(PYTHON) -m py_compile $(PACKAGE)/router.py
+	@$(PYTHON) -m py_compile $(PACKAGE)/validation.py
+	@$(PYTHON) -m py_compile $(PACKAGE)/metrics.py
+	@$(PYTHON) -m py_compile $(PACKAGE)/optimizer.py
+	@$(PYTHON) -m py_compile $(PACKAGE)/server.py
+	@$(PYTHON) -m py_compile $(PACKAGE)/scheduler.py
 	@echo "All files OK."
 
 # ─────────────────────────── run: all modes ─────────────────────────────
@@ -94,6 +108,10 @@ lint: ## Syntax-check all Python source files
 .PHONY: run-cascade
 run-cascade: ## Run cascade mode (default — all models smallest→largest)
 	$(PYTHON) -m $(PACKAGE) -m cascade $(QUERY)
+
+.PHONY: run-auto
+run-auto: ## Run auto mode (router classifies complexity, picks best strategy)
+	$(PYTHON) -m $(PACKAGE) -m auto $(QUERY)
 
 .PHONY: run-consensus
 run-consensus: ## Run consensus mode (all models answer, strongest merges)
@@ -128,15 +146,19 @@ run-agent: ## Run agent mode (autonomous planning + tools + memory)
 	$(PYTHON) -m $(PACKAGE) -m agent --max-iterations $(MAX_ITER) $(AGENT_GOAL)
 
 .PHONY: run-pcap
-run-pcap: ## Run pcap mode (analyze a .pcap file)
+run-pcap: ## Run pcap mode (analyze a .pcap file — CLI only)
 	$(PYTHON) -m $(PACKAGE) -m pcap --pcap $(PCAP_FILE)
+
+.PHONY: run-k8s
+run-k8s: ## Run k8s mode (analyze a Kubernetes/OpenShift cluster — CLI only)
+	$(PYTHON) -m $(PACKAGE) -m k8s --kubeconfig $(KUBECONFIG)
 
 .PHONY: run-all
 run-all: ## Run ALL chaining modes sequentially with the same query
 	@echo "════════════════════════════════════════════════════════════"
 	@echo " Running all modes with: $(QUERY)"
 	@echo "════════════════════════════════════════════════════════════"
-	@for mode in cascade consensus route pipeline verify search fast strong; do \
+	@for mode in cascade auto consensus route pipeline verify search fast strong; do \
 		echo ""; \
 		echo "──────────── Mode: $$mode ────────────"; \
 		$(PYTHON) -m $(PACKAGE) -m $$mode $(QUERY); \
@@ -149,6 +171,16 @@ run-all: ## Run ALL chaining modes sequentially with the same query
 	@echo "════════════════════════════════════════════════════════════"
 	@echo " All modes completed."
 	@echo "════════════════════════════════════════════════════════════"
+
+# ──────────────────────────── server ──────────────────────────────────
+
+.PHONY: server
+server: ## Start the API server on 127.0.0.1 port 8585
+	ollama-chain-server
+
+.PHONY: server-dev
+server-dev: ## Start the API server with verbose logging
+	ollama-chain-server --job-timeout 900 --log-dir .logs
 
 # ──────────────────────────── utilities ─────────────────────────────────
 

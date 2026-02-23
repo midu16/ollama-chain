@@ -14,6 +14,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private view?: vscode.WebviewView;
     private messages: ChatMessage[] = [];
     private isRunning = false;
+    private sessionStartTime: number | null = null;
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -41,8 +42,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'cancel':
                     this.runner.cancel();
-                    this.isRunning = false;
-                    this.postMessage({ type: 'setRunning', running: false });
+                    this.endSession();
                     this.addMessage('status', 'Cancelled.');
                     break;
                 case 'clearChat':
@@ -57,11 +57,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'getConfig':
                     this.sendConfig();
                     break;
+                case 'ready':
+                    this.syncFullState();
+                    break;
+            }
+        });
+
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                this.syncFullState();
             }
         });
 
         this.sendConfig();
-        this.syncMessages();
+        this.syncFullState();
     }
 
     public async sendPromptFromCommand(): Promise<void> {
@@ -110,7 +119,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const models = await this.runner.listModels();
         if (models.length === 0) {
             vscode.window.showWarningMessage(
-                'No Ollama models found. Is Ollama running? Try: ollama pull qwen3:14b'
+                'No models found. Is the API server running? Start with: ollama-chain-server'
             );
             return;
         }
@@ -123,6 +132,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    // ── Session lifecycle ──
+
+    private startSession(): void {
+        this.isRunning = true;
+        this.sessionStartTime = Date.now();
+        this.postMessage({
+            type: 'setRunning',
+            running: true,
+            startTime: this.sessionStartTime,
+        });
+    }
+
+    private endSession(): void {
+        this.isRunning = false;
+        this.sessionStartTime = null;
+        this.postMessage({ type: 'setRunning', running: false });
+    }
+
+    private syncFullState(): void {
+        this.syncMessages();
+        this.sendConfig();
+        if (this.isRunning) {
+            this.postMessage({
+                type: 'setRunning',
+                running: true,
+                startTime: this.sessionStartTime,
+            });
+        } else {
+            this.postMessage({ type: 'setRunning', running: false });
+        }
+    }
+
     // ── Prompt handling ──
 
     private async handlePrompt(prompt: string, options: ChainOptions): Promise<void> {
@@ -131,30 +172,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             return;
         }
 
-        this.isRunning = true;
         this.addMessage('user', prompt);
-        this.postMessage({ type: 'setRunning', running: true });
 
-        const cliAvailable = await this.runner.isCliAvailable(options.cliCommand);
-
-        let result;
-        if (cliAvailable) {
-            this.addMessage('status', `Running in ${options.mode} mode...`);
-            result = await this.runner.runChain(prompt, options, (line) => {
-                this.postMessage({ type: 'progress', line });
-            });
-        } else {
+        const apiAvailable = await this.runner.isApiAvailable(options.apiUrl);
+        if (!apiAvailable) {
             this.addMessage(
-                'status',
-                'ollama-chain CLI not found — using direct Ollama API. Install ollama-chain for full chain features.',
+                'error',
+                `Cannot connect to ollama-chain API at ${options.apiUrl}. ` +
+                'Start the server with: ollama-chain-server',
             );
-            result = await this.runner.callOllamaDirectly(prompt, options);
+            return;
         }
 
-        this.isRunning = false;
-        this.postMessage({ type: 'setRunning', running: false });
+        const progressCb = (line: string) => {
+            this.postMessage({ type: 'progress', line });
+        };
+
+        this.addMessage('status', `Running in ${options.mode} mode via API...`);
+        this.startSession();
+
+        const result = await this.runner.runViaApi(prompt, options, progressCb);
+
+        this.endSession();
 
         if (result.success && result.output) {
+            if (result.stderr) {
+                this.addMessage('status', result.stderr);
+            }
             this.addMessage('assistant', result.output, options.mode);
         } else if (!result.success) {
             this.addMessage('error', result.stderr || 'Unknown error occurred.');
@@ -302,6 +346,50 @@ body {
     font-style: italic;
 }
 
+/* ── Session bar ── */
+
+.session-bar {
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 12px;
+    font-size: 11px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    background: var(--vscode-editor-background);
+    flex-shrink: 0;
+    gap: 8px;
+}
+
+.session-bar.visible { display: flex; }
+
+.session-indicator {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--vscode-descriptionForeground);
+}
+
+.session-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--vscode-charts-green, #89d185);
+    flex-shrink: 0;
+    animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+.session-timer {
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    flex-shrink: 0;
+}
+
 /* ── Chat ── */
 
 .chat-area {
@@ -376,12 +464,7 @@ body {
 }
 
 .message-body { font-size: 13px; }
-
-.message-body h2, .message-body h3, .message-body h4 {
-    margin: 8px 0 4px;
-    font-weight: 600;
-}
-
+.message-body h2, .message-body h3, .message-body h4 { margin: 8px 0 4px; font-weight: 600; }
 .message-body h2 { font-size: 15px; }
 .message-body h3 { font-size: 14px; }
 .message-body h4 { font-size: 13px; }
@@ -420,11 +503,7 @@ body {
     font-size: 12px;
 }
 
-.message-body ul, .message-body ol {
-    padding-left: 20px;
-    margin: 4px 0;
-}
-
+.message-body ul, .message-body ol { padding-left: 20px; margin: 4px 0; }
 .message-body li { margin: 2px 0; }
 .message-body strong { font-weight: 600; }
 
@@ -622,11 +701,19 @@ body {
     </div>
 </div>
 
+<div class="session-bar" id="sessionBar">
+    <div class="session-indicator">
+        <span class="session-dot"></span>
+        <span>Session active &mdash; API</span>
+    </div>
+    <span class="session-timer" id="sessionTimer">00:00</span>
+</div>
+
 <div class="chat-area" id="chatArea">
     <div class="welcome" id="welcome">
         <h2>Ollama Chain</h2>
         <p>Chat with your local LLMs using chain modes.</p>
-        <p>Select a mode above and type your prompt below.</p>
+        <p>Requires the API server: <kbd>ollama-chain-server</kbd></p>
         <p style="margin-top:12px">
             <kbd>Enter</kbd> to send &middot; <kbd>Shift+Enter</kbd> for newline
         </p>

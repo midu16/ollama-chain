@@ -1,6 +1,61 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-  <ellipse cx="9" cy="7" rx="4" ry="3.5"/>
-  <ellipse cx="15" cy="17" rx="4" ry="3.5"/>
-  <path d="M13 7 v5 a5 3.5 0 0 0 2 2.8"/>
-  <path d="M11 17 v-5 a5 3.5 0 0 0 -2 -2.8"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#16213e"/>
+      <stop offset="100%" stop-color="#0f3460"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="128" height="128" rx="22" fill="url(#bg)"/>
+
+  <!-- Llama -->
+  <!-- Left ear -->
+  <path d="M42 56L35 28c-1-4 4-5 5-2l5 26" fill="#c4956a"/>
+  <path d="M41 52l-4-20c-.5-2.5 2-3 2.5-1l3 18" fill="#e0b994"/>
+  <!-- Right ear -->
+  <path d="M86 56l7-28c1-4-4-5-5-2l-5 26" fill="#c4956a"/>
+  <path d="M87 52l4-20c.5-2.5-2-3-2.5-1l-3 18" fill="#e0b994"/>
+
+  <!-- Head -->
+  <ellipse cx="64" cy="72" rx="28" ry="25" fill="#c4956a"/>
+  <!-- Face -->
+  <ellipse cx="64" cy="78" rx="18" ry="14" fill="#e0c9a8"/>
+
+  <!-- Left eye -->
+  <ellipse cx="52" cy="66" rx="5" ry="5.5" fill="white"/>
+  <circle cx="53" cy="65" r="3" fill="#1a1a2e"/>
+  <circle cx="54.5" cy="63.5" r="1" fill="white"/>
+
+  <!-- Right eye -->
+  <ellipse cx="76" cy="66" rx="5" ry="5.5" fill="white"/>
+  <circle cx="77" cy="65" r="3" fill="#1a1a2e"/>
+  <circle cx="78.5" cy="63.5" r="1" fill="white"/>
+
+  <!-- Nose -->
+  <ellipse cx="64" cy="84" rx="5" ry="3" fill="#a07a52"/>
+  <ellipse cx="61" cy="84" rx="1.5" ry="1" fill="#8a6842"/>
+  <ellipse cx="67" cy="84" rx="1.5" ry="1" fill="#8a6842"/>
+
+  <!-- Mouth -->
+  <path d="M60 88q4 3.5 8 0" fill="none" stroke="#a07a52" stroke-width="1.5" stroke-linecap="round"/>
+
+  <!-- Neck -->
+  <rect x="46" y="96" width="36" height="18" rx="8" fill="#c4956a"/>
+
+  <!-- Bee -->
+  <!-- Wings -->
+  <ellipse cx="55" cy="28" rx="7" ry="5" fill="white" fill-opacity="0.45" stroke="#e6a800" stroke-width="0.6"/>
+  <ellipse cx="73" cy="28" rx="7" ry="5" fill="white" fill-opacity="0.45" stroke="#e6a800" stroke-width="0.6"/>
+  <!-- Body -->
+  <ellipse cx="64" cy="34" rx="10" ry="6.5" fill="#ffc107"/>
+  <!-- Stripes -->
+  <line x1="58" y1="28.5" x2="58" y2="39.5" stroke="#333" stroke-width="2.8" stroke-linecap="round" opacity="0.45"/>
+  <line x1="64" y1="27.5" x2="64" y2="40.5" stroke="#333" stroke-width="2.8" stroke-linecap="round" opacity="0.45"/>
+  <line x1="70" y1="28.5" x2="70" y2="39.5" stroke="#333" stroke-width="2.8" stroke-linecap="round" opacity="0.45"/>
+  <!-- Antennae -->
+  <path d="M58 29L53 19" stroke="#333" stroke-width="1.3" stroke-linecap="round" fill="none"/>
+  <circle cx="53" cy="19" r="2" fill="#333"/>
+  <path d="M70 29L75 19" stroke="#333" stroke-width="1.3" stroke-linecap="round" fill="none"/>
+  <circle cx="75" cy="19" r="2" fill="#333"/>
 </svg>

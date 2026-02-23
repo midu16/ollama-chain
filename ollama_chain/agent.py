@@ -20,6 +20,7 @@ from .common import (
     ask,
     build_structured_prompt,
     chat_with_retry,
+    model_supports_thinking,
     sanitize_messages,
 )
 from .memory import SessionMemory, PersistentMemory
@@ -55,11 +56,16 @@ def _agent_chat(
     all_models: list[str],
     messages: list[dict],
     preferred_models: list[str] | None = None,
+    thinking: bool = False,
 ) -> tuple[str, str] | None:
     """Try models from strongest to weakest.  Return (model, text) or None.
 
     When *preferred_models* is given, try those first (in order) before
     falling back to the remaining models strongest-first.
+
+    *thinking*: when ``True`` the model is allowed to reason internally.
+    When ``False``, thinking-capable models receive a ``/no_think``
+    prefix on the last user message to suppress chain-of-thought.
     """
     if preferred_models:
         seen = set(preferred_models)
@@ -70,7 +76,12 @@ def _agent_chat(
         models_to_try = list(reversed(all_models))
     for model in models_to_try:
         try:
-            resp = chat_with_retry(model=model, messages=messages, retries=2)
+            chat_msgs = list(messages)
+            if not thinking and model_supports_thinking(model):
+                last = chat_msgs[-1].copy()
+                last["content"] = "/no_think\n" + last["content"]
+                chat_msgs[-1] = last
+            resp = chat_with_retry(model=model, messages=chat_msgs, retries=2)
             text = resp["message"]["content"]
             if "<think>" in text:
                 end = text.find("</think>")
@@ -183,6 +194,18 @@ def _auto_execute_step(step: dict, session: SessionMemory) -> ToolResult | None:
     if tool == "web_search_news":
         query = _build_search_query(desc, session.facts)
         return execute_tool_with_retry("web_search_news", {"query": query})
+
+    if tool == "github_search":
+        query = _build_search_query(desc, session.facts)
+        return execute_tool_with_retry("github_search", {"query": query})
+
+    if tool == "stackoverflow_search":
+        query = _build_search_query(desc, session.facts)
+        return execute_tool_with_retry("stackoverflow_search", {"query": query})
+
+    if tool == "docs_search":
+        query = _build_search_query(desc, session.facts)
+        return execute_tool_with_retry("docs_search", {"query": query})
 
     if tool == "read_file":
         paths = re.findall(r'(/[\w./\-]+)', desc)
@@ -392,7 +415,15 @@ def _execute_step(
     preferred = step.get("preferred_models") or select_models_for_step(
         step, all_models, query_complexity,
     )
-    chat_result = _agent_chat(all_models, messages, preferred_models=preferred)
+    step_needs_thinking = (
+        step_tool == "none"
+        and query_complexity != "simple"
+    )
+    chat_result = _agent_chat(
+        all_models, messages,
+        preferred_models=preferred,
+        thinking=step_needs_thinking,
+    )
 
     if chat_result is not None:
         model_used, raw = chat_result
@@ -854,13 +885,13 @@ def _synthesize_final(prompt: str, all_models: list[str]) -> str:
 
     Uses the same smallest-to-largest chaining strategy as the cascade
     mode so the agent benefits from multi-model accuracy:
-      1. Smallest model drafts from collected evidence
-      2. Each intermediate model reviews, corrects, strengthens citations
-      3. Largest model produces the definitive answer
+      1. Smallest model drafts from collected evidence (no thinking)
+      2. Each intermediate model reviews with thinking + lower temp
+      3. Largest model produces the definitive answer with thinking
     """
     n = len(all_models)
 
-    # --- Stage 1: first model drafts ---
+    # --- Stage 1: first model drafts (no thinking — speed) ---
     print(
         f"[agent]   Cascade synthesis 1/{n}: drafting with {all_models[0]}...",
         file=sys.stderr,
@@ -871,7 +902,7 @@ def _synthesize_final(prompt: str, all_models: list[str]) -> str:
         print(f"[agent]   {all_models[0]} failed ({e}), trying others...", file=sys.stderr)
         for model in all_models[1:]:
             try:
-                return ask(prompt, model=model, thinking=True)
+                return ask(prompt, model=model, thinking=True, temperature=0.3)
             except Exception:
                 continue
         return "(Agent could not generate a final answer — all models unavailable.)"
@@ -879,10 +910,10 @@ def _synthesize_final(prompt: str, all_models: list[str]) -> str:
     if n == 1:
         return current
 
-    # --- Stages 2..N-1: intermediate models refine ---
+    # --- Stages 2..N-1: intermediate models refine (thinking + low temp) ---
     for i, model in enumerate(all_models[1:-1], start=2):
         print(
-            f"[agent]   Cascade synthesis {i}/{n}: refining with {model}...",
+            f"[agent]   Cascade synthesis {i}/{n}: refining with {model} +think...",
             file=sys.stderr,
         )
         try:
@@ -900,13 +931,14 @@ def _synthesize_final(prompt: str, all_models: list[str]) -> str:
                 f"Output ONLY the improved answer.",
                 model=model,
                 thinking=True,
+                temperature=0.4,
             )
         except Exception as e:
             print(f"[agent]   {model} unavailable ({e}), skipping...", file=sys.stderr)
 
     # --- Final stage: strongest model produces definitive answer ---
     print(
-        f"[agent]   Cascade synthesis {n}/{n}: final answer with {all_models[-1]}...",
+        f"[agent]   Cascade synthesis {n}/{n}: final answer with {all_models[-1]} +think...",
         file=sys.stderr,
     )
     try:
@@ -922,6 +954,7 @@ def _synthesize_final(prompt: str, all_models: list[str]) -> str:
             f"Output ONLY the final authoritative answer.",
             model=all_models[-1],
             thinking=True,
+            temperature=0.3,
         )
     except Exception as e:
         print(

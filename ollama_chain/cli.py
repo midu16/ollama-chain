@@ -6,8 +6,8 @@ import gc
 import sys
 
 from .models import discover_models, ensure_memory_available, model_names, pick_models, list_models_table
-from .chains import CHAINS, chain_pcap
-from .common import unload_all_models
+from .chains import CHAINS, chain_pcap, chain_k8s
+from .common import ensure_sources, unload_all_models
 from .memory import PersistentMemory
 from .metrics import evaluate_prompt, evaluate_mode_alignment, evaluate_response
 from .optimizer import optimize_prompt, format_optimization_report
@@ -40,7 +40,8 @@ modes:
   verify      Fast model drafts, strong model verifies and refines
   search      Search-first: always fetches web results, strong model synthesizes
   agent       Autonomous agent with planning, memory, tools, and dynamic control flow
-  pcap        Analyze a .pcap file (auto-detected from query, or use --pcap)
+  pcap        Analyze a .pcap file (auto-detected from query, or use --pcap)  [CLI only]
+  k8s         Analyze a Kubernetes/OpenShift cluster (use --kubeconfig)       [CLI only]
   fast        Direct to smallest/fastest model
   strong      Direct to largest/strongest model
 
@@ -50,13 +51,24 @@ agent mode:
   long-term memory (~/.ollama_chain/), and re-plans dynamically on
   failures.  Use --max-iterations to control the execution budget.
 
-web search:
-  All modes automatically search the web for context (via DuckDuckGo).
-  Use --no-search to disable this and run fully offline.
+web search (multi-source):
+  All modes search multiple sources in parallel for context:
+  DuckDuckGo (web), GitHub (repos + issues), Stack Overflow (Q&A),
+  and trusted documentation sites (kubernetes.io, MDN, Red Hat, etc.).
+  No API keys required.  Use --no-search to run fully offline.
 
 source citations:
   All modes instruct models to cite authoritative sources (IETF RFCs,
   IEEE, ISO, NIST, W3C, Red Hat, kernel.org, MDN, official docs).
+  Every answer includes a mandatory ## Sources section.  If the model
+  omits it, a follow-up call appends one automatically.
+
+k8s mode:
+  The k8s mode gathers comprehensive cluster state via oc (preferred)
+  or kubectl using the supplied --kubeconfig file.  Works with both
+  vanilla Kubernetes and OpenShift clusters.  Collects nodes, pods,
+  deployments, services, events, storage, operators, routes, etc.
+  and produces an expert report.  Available only from the CLI.
 
 prompt quality metrics:
   Use --metrics to display prompt quality scores alongside normal execution.
@@ -81,6 +93,8 @@ examples:
   %(prog)s --no-search "What is 2+2?"
   %(prog)s -m pcap --pcap capture.pcap
   %(prog)s "Analyze /tmp/dump.pcap for errors"
+  %(prog)s -m k8s --kubeconfig ~/.kube/config "Why are pods crashing?"
+  %(prog)s -m k8s --kubeconfig /tmp/ocp.kubeconfig "Show cluster health"
   %(prog)s --metrics "Explain the TCP three-way handshake step by step"
   %(prog)s --metrics-only "Compare REST vs GraphQL for microservice architectures"
   %(prog)s --optimize "explain docker"
@@ -92,7 +106,7 @@ examples:
     parser.add_argument("query", nargs="*", help="Query to process")
     parser.add_argument(
         "--mode", "-m",
-        choices=list(CHAINS.keys()) + ["pcap"],
+        choices=list(CHAINS.keys()) + ["pcap", "k8s"],
         default="cascade",
         help="Chaining mode (default: cascade)",
     )
@@ -100,6 +114,11 @@ examples:
         "--pcap", "-p",
         metavar="FILE",
         help="Path to .pcap/.pcapng file to analyze",
+    )
+    parser.add_argument(
+        "--kubeconfig", "-k",
+        metavar="FILE",
+        help="Path to kubeconfig file for k8s mode",
     )
     parser.add_argument(
         "--no-search",
@@ -238,6 +257,8 @@ examples:
     if not pcap_path and query:
         pcap_path = detect_pcap_path(query)
 
+    kubeconfig = args.kubeconfig
+
     try:
         import time as _time
         _t0 = _time.monotonic()
@@ -248,6 +269,16 @@ examples:
                 sys.exit(1)
             result = chain_pcap(
                 pcap_path, all_names,
+                query=query or None,
+                web_search=use_search,
+                fast=fast_override,
+            )
+        elif args.mode == "k8s" or kubeconfig:
+            if not kubeconfig:
+                print("Error: k8s mode requires --kubeconfig <file>", file=sys.stderr)
+                sys.exit(1)
+            result = chain_k8s(
+                kubeconfig, all_names,
                 query=query or None,
                 web_search=use_search,
                 fast=fast_override,
@@ -272,6 +303,9 @@ examples:
             )
 
         elapsed_ms = (_time.monotonic() - _t0) * 1000
+
+        effective_query = query or pcap_path or kubeconfig or ""
+        result = ensure_sources(result, effective_query, all_names[-1])
 
         if args.metrics and query:
             resp_metrics = evaluate_response(query, result, elapsed_ms)

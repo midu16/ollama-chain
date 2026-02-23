@@ -10,6 +10,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.registerWebviewViewProvider(
             ChatViewProvider.viewType,
             chatProvider,
+            { webviewOptions: { retainContextWhenHidden: true } },
         ),
     );
 

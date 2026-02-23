@@ -2,7 +2,7 @@
   "name": "ollama-chain",
   "displayName": "Ollama Chain",
   "description": "Interact with Ollama Chain agent — choose chain modes, configure settings, and chat with local LLMs directly from VS Code.",
-  "version": "0.2.0",
+  "version": "0.5.0",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -97,22 +97,17 @@
           "maximum": 50,
           "description": "Maximum iterations for agent mode"
         },
-        "ollamaChain.ollamaUrl": {
+        "ollamaChain.apiUrl": {
           "type": "string",
-          "default": "http://localhost:11434",
-          "description": "Ollama server URL"
+          "default": "http://localhost:8585",
+          "description": "ollama-chain API server URL (start with: ollama-chain-server)"
         },
-        "ollamaChain.cliCommand": {
-          "type": "string",
-          "default": "ollama-chain",
-          "description": "Command to invoke the ollama-chain CLI (e.g. 'ollama-chain' or 'python -m ollama_chain')"
-        },
-        "ollamaChain.cliTimeout": {
+        "ollamaChain.timeout": {
           "type": "number",
-          "default": 300,
-          "minimum": 30,
-          "maximum": 600,
-          "description": "Timeout in seconds for CLI execution"
+          "default": 600,
+          "minimum": 60,
+          "maximum": 3600,
+          "description": "Per-job timeout in seconds. The server kills the chain subprocess after this duration. Partial results may be returned."
         }
       }
     }
