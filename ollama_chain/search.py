@@ -7,15 +7,20 @@ block for LLM consumption.
 
 import json
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field
 
 from ddgs import DDGS
 
 _HTTP_TIMEOUT = 8  # seconds for GitHub / Stack Overflow API calls
+_MAX_RESPONSE_BYTES = 512 * 1024  # 512 KB cap on API response bodies
+_DDGS_TIMEOUT = 10  # seconds for each DuckDuckGo search call
+_SEARCH_PIPELINE_TIMEOUT = 30  # hard deadline for the entire search pipeline
+_FUTURE_TIMEOUT = 12  # per-future timeout in the parallel search
 
 TRUSTED_DOCS_DOMAINS = (
     "kubernetes.io", "docs.openshift.com", "docs.redhat.com",
@@ -35,11 +40,21 @@ class SearchResult:
     source: str = "web"
 
 
+def _run_with_deadline(fn, *args, timeout: float = _DDGS_TIMEOUT, **kwargs):
+    """Run *fn* in a thread with a hard timeout; returns result or raises."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fn, *args, **kwargs)
+        return future.result(timeout=timeout)
+
+
 def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
     """Search DuckDuckGo and return top results."""
     try:
-        ddgs = DDGS()
-        raw = list(ddgs.text(query, max_results=max_results))
+        ddgs = DDGS(timeout=_DDGS_TIMEOUT)
+        raw = list(_run_with_deadline(ddgs.text, query, max_results=max_results, timeout=_DDGS_TIMEOUT))
+    except TimeoutError:
+        print(f"[search] Warning: web search timed out ({_DDGS_TIMEOUT}s)", file=sys.stderr)
+        return []
     except Exception as e:
         print(f"[search] Warning: web search failed — {e}", file=sys.stderr)
         return []
@@ -58,8 +73,11 @@ def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
 def web_search_news(query: str, max_results: int = 5) -> list[SearchResult]:
     """Search DuckDuckGo news for recent/time-sensitive queries."""
     try:
-        ddgs = DDGS()
-        raw = list(ddgs.news(query, max_results=max_results))
+        ddgs = DDGS(timeout=_DDGS_TIMEOUT)
+        raw = list(_run_with_deadline(ddgs.news, query, max_results=max_results, timeout=_DDGS_TIMEOUT))
+    except TimeoutError:
+        print(f"[search] Warning: news search timed out ({_DDGS_TIMEOUT}s)", file=sys.stderr)
+        return []
     except Exception as e:
         print(f"[search] Warning: news search failed — {e}", file=sys.stderr)
         return []
@@ -79,6 +97,11 @@ def web_search_news(query: str, max_results: int = 5) -> list[SearchResult]:
 # GitHub search (unauthenticated REST API — 10 req/min)
 # ---------------------------------------------------------------------------
 
+def _read_limited(resp, max_bytes: int = _MAX_RESPONSE_BYTES) -> bytes:
+    """Read up to *max_bytes* from an HTTP response to bound memory usage."""
+    return resp.read(max_bytes)
+
+
 def github_search(query: str, max_results: int = 5) -> list[SearchResult]:
     """Search GitHub repositories via the public REST API."""
     params = urllib.parse.urlencode({
@@ -94,7 +117,7 @@ def github_search(query: str, max_results: int = 5) -> list[SearchResult]:
     })
     try:
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode())
+            data = json.loads(_read_limited(resp).decode())
     except Exception as e:
         print(f"[search] Warning: GitHub search failed — {e}", file=sys.stderr)
         return []
@@ -137,7 +160,7 @@ def github_search_issues(
     })
     try:
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode())
+            data = json.loads(_read_limited(resp).decode())
     except Exception as e:
         print(f"[search] Warning: GitHub issue search failed — {e}", file=sys.stderr)
         return []
@@ -180,7 +203,7 @@ def stackoverflow_search(
     req = urllib.request.Request(url, headers={"User-Agent": "ollama-chain"})
     try:
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
-            raw = resp.read()
+            raw = _read_limited(resp)
             import gzip
             try:
                 raw = gzip.decompress(raw)
@@ -220,8 +243,11 @@ def docs_search(
     site_clause = " OR ".join(f"site:{d}" for d in domains[:8])
     scoped_query = f"{query} ({site_clause})"
     try:
-        ddgs = DDGS()
-        raw = list(ddgs.text(scoped_query, max_results=max_results))
+        ddgs = DDGS(timeout=_DDGS_TIMEOUT)
+        raw = list(_run_with_deadline(ddgs.text, scoped_query, max_results=max_results, timeout=_DDGS_TIMEOUT))
+    except TimeoutError:
+        print(f"[search] Warning: docs search timed out ({_DDGS_TIMEOUT}s)", file=sys.stderr)
+        return []
     except Exception as e:
         print(f"[search] Warning: docs search failed — {e}", file=sys.stderr)
         return []
@@ -295,7 +321,7 @@ def generate_search_queries(query: str, fast_model: str) -> list[str]:
 
 def search_for_query(query: str, fast_model: str, max_results: int = 5) -> str:
     """
-    Full multi-source search pipeline:
+    Full multi-source search pipeline with hard deadline:
       1. Fast model generates search queries
       2. All providers searched in parallel:
          - DuckDuckGo (general web)
@@ -303,15 +329,29 @@ def search_for_query(query: str, fast_model: str, max_results: int = 5) -> str:
          - Stack Overflow (Q&A)
          - Trusted documentation sites (site-scoped DDG)
       3. Results aggregated, deduplicated, and formatted
+
+    The entire pipeline is capped at _SEARCH_PIPELINE_TIMEOUT seconds.
+    Individual futures that exceed _FUTURE_TIMEOUT are abandoned.
     """
+    deadline = time.monotonic() + _SEARCH_PIPELINE_TIMEOUT
+
     print(f"[search] Generating search queries with {fast_model}...", file=sys.stderr)
-    search_queries = generate_search_queries(query, fast_model)
+    try:
+        search_queries = generate_search_queries(query, fast_model)
+    except Exception as e:
+        print(f"[search] Query generation failed ({e}), using original query", file=sys.stderr)
+        search_queries = []
 
     if not search_queries:
         search_queries = [query]
 
     primary_query = search_queries[0]
     print(f"[search] Searching: {search_queries}", file=sys.stderr)
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 2:
+        print("[search] Pipeline deadline reached before search, skipping", file=sys.stderr)
+        return ""
 
     seen_urls: set[str] = set()
     all_results: list[SearchResult] = []
@@ -322,7 +362,7 @@ def search_for_query(query: str, fast_model: str, max_results: int = 5) -> str:
                 seen_urls.add(r.url)
                 all_results.append(r)
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {}
 
         for sq in search_queries:
@@ -333,16 +373,28 @@ def search_for_query(query: str, fast_model: str, max_results: int = 5) -> str:
         futures[pool.submit(stackoverflow_search, primary_query, 3)] = "stackoverflow"
         futures[pool.submit(docs_search, primary_query)] = "docs"
 
-        for future in as_completed(futures):
-            label = futures[future]
-            try:
-                results = future.result()
-                _collect(results)
-            except Exception as e:
-                print(
-                    f"[search] {label} failed: {e}",
-                    file=sys.stderr,
-                )
+        try:
+            iter_timeout = min(_FUTURE_TIMEOUT, max(1, deadline - time.monotonic()))
+            for future in as_completed(futures, timeout=iter_timeout):
+                label = futures[future]
+                try:
+                    results = future.result(timeout=1)
+                    _collect(results)
+                except TimeoutError:
+                    print(f"[search] {label} timed out, skipping", file=sys.stderr)
+                except Exception as e:
+                    print(f"[search] {label} failed: {e}", file=sys.stderr)
+
+                if time.monotonic() >= deadline:
+                    print("[search] Pipeline deadline reached, using results so far", file=sys.stderr)
+                    break
+        except TimeoutError:
+            n_done = sum(1 for f in futures if f.done())
+            print(
+                f"[search] Search timed out ({n_done}/{len(futures)} sources completed), "
+                f"using partial results",
+                file=sys.stderr,
+            )
 
     all_results = all_results[:max_results * 4]
 

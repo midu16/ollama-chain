@@ -9,7 +9,10 @@ from ollama_chain.scheduler import (
     PromptJob,
     Scheduler,
     _DEFAULT_JOB_TIMEOUT,
+    _DEFAULT_IDLE_TIMEOUT,
     _get_available_memory_ratio,
+    _idle_timeout_for_mode,
+    _timeout_suggestions,
 )
 
 
@@ -37,9 +40,19 @@ class TestPromptJob:
         assert d["job_id"] == "xyz"
         assert d["status"] == "queued"
         assert d["timeout"] == _DEFAULT_JOB_TIMEOUT
+        assert d["remaining_seconds"] is None
         assert "result" in d
         assert "error" in d
         assert "progress" in d
+
+    def test_to_dict_running_shows_remaining(self):
+        job = PromptJob(id="r", prompt="q", mode="fast")
+        job.status = "running"
+        job.started_at = time.time()
+        job.effective_deadline = time.time() + 300
+        d = job.to_dict()
+        assert d["remaining_seconds"] is not None
+        assert 290 <= d["remaining_seconds"] <= 300
 
     def test_custom_timeout(self):
         job = PromptJob(id="t", prompt="q", mode="fast", timeout=120)
@@ -140,6 +153,86 @@ class TestSchedulerAsync:
         await scheduler.submit("q1", "fast")
         await scheduler.submit("q2", "fast")
         assert scheduler.queue_size == 2
+
+    @pytest.mark.asyncio
+    async def test_extend_timeout_nonexistent(self, scheduler):
+        assert scheduler.extend_timeout("missing", 300) is None
+
+    @pytest.mark.asyncio
+    async def test_extend_timeout_queued_returns_none(self, scheduler):
+        job = await scheduler.submit("q", "fast")
+        assert job.status == "queued"
+        assert scheduler.extend_timeout(job.id, 300) is None
+
+    @pytest.mark.asyncio
+    async def test_extend_timeout_running(self, scheduler):
+        job = await scheduler.submit("q", "fast")
+        job.status = "running"
+        job.started_at = time.time()
+        job.effective_deadline = time.time() + 100
+        old_timeout = job.timeout
+        result = scheduler.extend_timeout(job.id, 200)
+        assert result is not None
+        assert result["extended_by"] == 200
+        assert result["remaining"] > 0
+        assert job.timeout == old_timeout + 200
+
+    @pytest.mark.asyncio
+    async def test_extend_timeout_accumulates(self, scheduler):
+        job = await scheduler.submit("q", "fast")
+        job.status = "running"
+        job.started_at = time.time()
+        job.effective_deadline = time.time() + 100
+        old_timeout = job.timeout
+        scheduler.extend_timeout(job.id, 300)
+        scheduler.extend_timeout(job.id, 300)
+        assert job.timeout == old_timeout + 600
+
+
+# ---------------------------------------------------------------------------
+# _timeout_suggestions
+# ---------------------------------------------------------------------------
+
+class TestTimeoutSuggestions:
+    def test_cascade_suggestions(self):
+        s = _timeout_suggestions("cascade", 360, 360)
+        assert "no output" in s
+        assert "faster mode" in s
+
+    def test_fast_mode_suggests_simpler_prompt(self):
+        s = _timeout_suggestions("fast", 180, 180)
+        assert "no output" in s
+        assert "simpler prompt" in s
+
+    def test_agent_suggestions(self):
+        s = _timeout_suggestions("agent", 600, 600)
+        assert "max_iterations" in s
+
+    def test_includes_idle_info(self):
+        s = _timeout_suggestions("cascade", 400, 360)
+        assert "400s" in s
+        assert "360s" in s
+
+
+# ---------------------------------------------------------------------------
+# _idle_timeout_for_mode
+# ---------------------------------------------------------------------------
+
+class TestIdleTimeoutForMode:
+    def test_agent_has_longest_idle(self):
+        assert _idle_timeout_for_mode("agent") >= 600
+
+    def test_fast_uses_default(self):
+        assert _idle_timeout_for_mode("fast") == _DEFAULT_IDLE_TIMEOUT
+
+    def test_unknown_mode_uses_default(self):
+        assert _idle_timeout_for_mode("nonexistent") == _DEFAULT_IDLE_TIMEOUT
+
+    def test_agent_longer_than_default(self):
+        assert _idle_timeout_for_mode("agent") > _DEFAULT_IDLE_TIMEOUT
+
+    def test_cascade_longer_than_default(self):
+        assert _idle_timeout_for_mode("cascade") > _DEFAULT_IDLE_TIMEOUT
 
 
 # ---------------------------------------------------------------------------

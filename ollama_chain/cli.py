@@ -4,13 +4,15 @@
 import argparse
 import gc
 import sys
+import time as _time
 
 from .models import discover_models, ensure_memory_available, model_names, pick_models, list_models_table
 from .chains import CHAINS, chain_pcap, chain_k8s
-from .common import ensure_sources, unload_all_models
+from .common import SOURCE_GUIDANCE, ask, ensure_sources, unload_all_models
 from .memory import PersistentMemory
 from .metrics import evaluate_prompt, evaluate_mode_alignment, evaluate_response
 from .optimizer import optimize_prompt, format_optimization_report
+from .progress import ProgressBar, set_progress, progress_update
 
 
 def detect_pcap_path(text: str) -> str | None:
@@ -172,6 +174,11 @@ examples:
         action="store_true",
         help="Optimize and display the improved prompt, then exit (no execution)",
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Show verbose internal logging instead of the progress bar",
+    )
 
     args = parser.parse_args()
 
@@ -259,53 +266,18 @@ examples:
 
     kubeconfig = args.kubeconfig
 
-    try:
-        import time as _time
-        _t0 = _time.monotonic()
+    use_progress = not args.verbose and sys.stderr.isatty()
 
-        if args.mode == "pcap" or pcap_path:
-            if not pcap_path:
-                print("Error: pcap mode requires a .pcap file path (--pcap or in query)", file=sys.stderr)
-                sys.exit(1)
-            result = chain_pcap(
-                pcap_path, all_names,
-                query=query or None,
-                web_search=use_search,
-                fast=fast_override,
-            )
-        elif args.mode == "k8s" or kubeconfig:
-            if not kubeconfig:
-                print("Error: k8s mode requires --kubeconfig <file>", file=sys.stderr)
-                sys.exit(1)
-            result = chain_k8s(
-                kubeconfig, all_names,
-                query=query or None,
-                web_search=use_search,
-                fast=fast_override,
-            )
-        elif not query:
-            parser.print_help()
-            sys.exit(1)
-        elif args.mode == "agent":
-            chain_fn = CHAINS[args.mode]
-            result = chain_fn(
-                query, all_names,
-                web_search=use_search,
-                fast=fast_override,
-                max_iterations=args.max_iterations,
-            )
-        else:
-            chain_fn = CHAINS[args.mode]
-            result = chain_fn(
-                query, all_names,
-                web_search=use_search,
-                fast=fast_override,
-            )
+    try:
+        _t0 = _time.monotonic()
+        result = _run_chain(
+            args, query, all_names,
+            use_search, fast_override,
+            pcap_path, kubeconfig,
+            use_progress, parser,
+        )
 
         elapsed_ms = (_time.monotonic() - _t0) * 1000
-
-        effective_query = query or pcap_path or kubeconfig or ""
-        result = ensure_sources(result, effective_query, all_names[-1])
 
         if args.metrics and query:
             resp_metrics = evaluate_response(query, result, elapsed_ms)
@@ -318,3 +290,116 @@ examples:
     finally:
         unload_all_models(all_names)
         gc.collect()
+
+
+def _run_chain(
+    args,
+    query: str,
+    all_names: list[str],
+    use_search: bool,
+    fast_override: str | None,
+    pcap_path: str | None,
+    kubeconfig: str | None,
+    use_progress: bool,
+    parser,
+) -> str:
+    """Execute the chain with progress bar and guaranteed answer fallback."""
+
+    def _execute() -> str:
+        """Run the requested chain mode and return the result."""
+        if args.mode == "pcap" or pcap_path:
+            if not pcap_path:
+                print("Error: pcap mode requires a .pcap file path (--pcap or in query)", file=sys.stderr)
+                sys.exit(1)
+            return chain_pcap(
+                pcap_path, all_names,
+                query=query or None,
+                web_search=use_search,
+                fast=fast_override,
+            )
+        elif args.mode == "k8s" or kubeconfig:
+            if not kubeconfig:
+                print("Error: k8s mode requires --kubeconfig <file>", file=sys.stderr)
+                sys.exit(1)
+            return chain_k8s(
+                kubeconfig, all_names,
+                query=query or None,
+                web_search=use_search,
+                fast=fast_override,
+            )
+        elif not query:
+            parser.print_help()
+            sys.exit(1)
+        elif args.mode == "agent":
+            chain_fn = CHAINS[args.mode]
+            return chain_fn(
+                query, all_names,
+                web_search=use_search,
+                fast=fast_override,
+                max_iterations=args.max_iterations,
+            )
+        else:
+            chain_fn = CHAINS[args.mode]
+            return chain_fn(
+                query, all_names,
+                web_search=use_search,
+                fast=fast_override,
+            )
+
+    def _fallback_answer(error: Exception) -> str:
+        """Guarantee an answer by falling back through simpler strategies."""
+        progress_update(50, "Primary chain failed, retrying with fallback...")
+        print(
+            f"[fallback] Primary chain failed ({error}), trying direct model...",
+            file=sys.stderr,
+        )
+        for model in reversed(all_names):
+            try:
+                progress_update(60, f"Fallback: answering with {model}...")
+                return ask(
+                    f"{SOURCE_GUIDANCE}\n\n{query}",
+                    model=model, thinking=True,
+                )
+            except Exception:
+                continue
+        for model in all_names:
+            try:
+                progress_update(70, f"Fallback: answering with {model} (no search)...")
+                return ask(query, model=model)
+            except Exception:
+                continue
+        return (
+            f"I was unable to generate a comprehensive answer due to "
+            f"technical difficulties with all available models.\n\n"
+            f"**Your question:** {query}\n\n"
+            f"Please try again, or use `--no-search` for fully offline mode."
+        )
+
+    if use_progress:
+        with ProgressBar() as bar:
+            set_progress(bar)
+            bar.update(0, "Starting...")
+            try:
+                result = _execute()
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                result = _fallback_answer(e)
+
+            effective_query = query or pcap_path or kubeconfig or ""
+            progress_update(95, "Verifying source citations...")
+            result = ensure_sources(result, effective_query, all_names[-1])
+            bar.finish()
+        set_progress(None)
+        return result
+    else:
+        try:
+            result = _execute()
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            result = _fallback_answer(e)
+
+        effective_query = query or pcap_path or kubeconfig or ""
+        result = ensure_sources(result, effective_query, all_names[-1])
+        return result

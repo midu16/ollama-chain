@@ -106,8 +106,7 @@
           "type": "number",
           "default": 600,
           "minimum": 60,
-          "maximum": 3600,
-          "description": "Per-job timeout in seconds. The server kills the chain subprocess after this duration. Partial results may be returned."
+          "description": "Base timeout in seconds. After this duration, the job will only be killed if the process goes idle (no output). As long as the process is actively producing output, it runs indefinitely."
         }
       }
     }

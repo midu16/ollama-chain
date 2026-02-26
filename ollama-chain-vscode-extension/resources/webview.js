@@ -5,10 +5,12 @@
     const modeDesc = document.getElementById('modeDesc');
     const webSearchCheck = document.getElementById('webSearchCheck');
     const maxIter = document.getElementById('maxIter');
+    const timeoutInput = document.getElementById('timeoutInput');
     const iterationsRow = document.getElementById('iterationsRow');
     const chatArea = document.getElementById('chatArea');
     const welcome = document.getElementById('welcome');
     const progressBar = document.getElementById('progressBar');
+    const timeoutRetry = document.getElementById('timeoutRetry');
     const promptInput = document.getElementById('promptInput');
     const sendBtn = document.getElementById('sendBtn');
     const cancelBtn = document.getElementById('cancelBtn');
@@ -19,6 +21,7 @@
     const settingsArrow = document.getElementById('settingsArrow');
     const sessionBar = document.getElementById('sessionBar');
     const sessionTimer = document.getElementById('sessionTimer');
+    const extendBtn = document.getElementById('extendBtn');
 
     const MODE_DESCRIPTIONS = {
         cascade: 'Chain ALL models smallest to largest, each refining the answer.',
@@ -93,7 +96,7 @@
             webSearch: webSearchCheck.checked,
             maxIterations: parseInt(maxIter.value, 10) || 15,
             apiUrl: currentConfig.apiUrl || 'http://localhost:8585',
-            timeout: currentConfig.timeout || 300,
+            timeout: parseInt(timeoutInput.value, 10) || 600,
         };
     }
 
@@ -105,6 +108,8 @@
         promptInput.style.height = 'auto';
         progressBar.innerHTML = '';
         progressBar.classList.remove('visible');
+        timeoutRetry.style.display = 'none';
+        timeoutRetry.innerHTML = '';
 
         vscode.postMessage({ type: 'sendPrompt', prompt: prompt, options: getOptions() });
     }
@@ -125,6 +130,10 @@
 
     cancelBtn.addEventListener('click', function () {
         vscode.postMessage({ type: 'cancel' });
+    });
+
+    extendBtn.addEventListener('click', function () {
+        vscode.postMessage({ type: 'extendTimeout', extraSeconds: 300 });
     });
 
     clearBtn.addEventListener('click', function () {
@@ -279,6 +288,66 @@
         }
     }
 
+    // ── Timeout retry UI ──
+
+    function showTimeoutRetry(msg) {
+        timeoutRetry.innerHTML = '';
+        var cur = msg.currentTimeout || 600;
+        var doubled = Math.min(cur * 2, 3600);
+
+        var label = document.createElement('span');
+        label.textContent = msg.hasPartial
+            ? 'Timed out with partial result.'
+            : 'Timed out with no result.';
+        label.style.color = 'var(--vscode-editorWarning-foreground, #cca700)';
+        timeoutRetry.appendChild(label);
+
+        if (doubled > cur) {
+            var retryBtn = document.createElement('button');
+            retryBtn.className = 'timeout-retry-btn';
+            retryBtn.textContent = 'Retry (' + doubled + 's)';
+            retryBtn.title = 'Retry the same prompt with ' + doubled + 's timeout';
+            retryBtn.addEventListener('click', function () {
+                timeoutRetry.style.display = 'none';
+                timeoutInput.value = doubled;
+                vscode.postMessage({
+                    type: 'retryWithTimeout',
+                    prompt: msg.prompt,
+                    options: msg.options,
+                    newTimeout: doubled,
+                });
+            });
+            timeoutRetry.appendChild(retryBtn);
+        }
+
+        var FASTER = {
+            cascade: 'fast', consensus: 'verify', agent: 'cascade',
+            pipeline: 'fast', strong: 'fast',
+        };
+        var fasterMode = FASTER[msg.options.mode];
+        if (fasterMode) {
+            var fasterBtn = document.createElement('button');
+            fasterBtn.className = 'timeout-retry-btn secondary';
+            fasterBtn.textContent = 'Try ' + fasterMode + ' mode';
+            fasterBtn.addEventListener('click', function () {
+                timeoutRetry.style.display = 'none';
+                modeSelect.value = fasterMode;
+                updateModeUI();
+                var opts = getOptions();
+                opts.mode = fasterMode;
+                vscode.postMessage({
+                    type: 'retryWithTimeout',
+                    prompt: msg.prompt,
+                    options: opts,
+                    newTimeout: opts.timeout,
+                });
+            });
+            timeoutRetry.appendChild(fasterBtn);
+        }
+
+        timeoutRetry.style.display = 'flex';
+    }
+
     // ── Messages from Extension ──
 
     window.addEventListener('message', function (event) {
@@ -312,6 +381,8 @@
                 if (isRunning) {
                     sessionBar.classList.add('visible');
                     startTimer(msg.startTime);
+                    timeoutRetry.style.display = 'none';
+                    timeoutRetry.innerHTML = '';
                 } else {
                     sessionBar.classList.remove('visible');
                     stopTimer();
@@ -337,8 +408,13 @@
                     modeSelect.value = msg.config.mode || 'cascade';
                     webSearchCheck.checked = msg.config.webSearch !== false;
                     maxIter.value = msg.config.maxIterations || 15;
+                    timeoutInput.value = msg.config.timeout || 600;
                     updateModeUI();
                 }
+                break;
+
+            case 'timeoutRetry':
+                showTimeoutRetry(msg);
                 break;
         }
     });

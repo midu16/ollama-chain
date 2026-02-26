@@ -228,3 +228,91 @@ async def test_options_request(aiohttp_client, app):
     resp = await client.options("/api/prompt")
     assert resp.status == 200
     assert "Access-Control-Allow-Methods" in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# Extend timeout endpoint
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_extend_timeout_running_job(aiohttp_client, app):
+    import time
+    from ollama_chain.server import scheduler as sched
+    client = await aiohttp_client(app)
+    submit = await client.post("/api/prompt", json={"prompt": "test"})
+    job_id = (await submit.json())["job_id"]
+
+    job = sched.get(job_id)
+    job.status = "running"
+    job.started_at = time.time()
+    job.effective_deadline = time.time() + 300
+
+    resp = await client.patch(
+        f"/api/prompt/{job_id}/timeout",
+        json={"extend_by": 120},
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["job_id"] == job_id
+    assert data["extended_by"] > 0
+    assert data["remaining"] > 0
+
+
+@pytest.mark.asyncio
+async def test_extend_timeout_nonexistent_job(aiohttp_client, app):
+    client = await aiohttp_client(app)
+    resp = await client.patch(
+        "/api/prompt/nonexistent/timeout",
+        json={"extend_by": 120},
+    )
+    assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_extend_timeout_queued_job_fails(aiohttp_client, app):
+    from ollama_chain.server import scheduler as sched
+    client = await aiohttp_client(app)
+    submit = await client.post("/api/prompt", json={"prompt": "test"})
+    job_id = (await submit.json())["job_id"]
+
+    job = sched.get(job_id)
+    job.status = "queued"
+    job.started_at = None
+
+    resp = await client.patch(
+        f"/api/prompt/{job_id}/timeout",
+        json={"extend_by": 120},
+    )
+    assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_extend_timeout_invalid_body(aiohttp_client, app):
+    client = await aiohttp_client(app)
+    resp = await client.patch(
+        "/api/prompt/whatever/timeout",
+        data=b"not json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_job_dict_has_remaining_seconds(aiohttp_client, app):
+    import time
+    from ollama_chain.server import scheduler as sched
+    client = await aiohttp_client(app)
+    submit = await client.post("/api/prompt", json={"prompt": "test"})
+    job_id = (await submit.json())["job_id"]
+
+    job = sched.get(job_id)
+    job.status = "running"
+    job.started_at = time.time()
+    job.effective_deadline = time.time() + 500
+
+    resp = await client.get(f"/api/prompt/{job_id}")
+    assert resp.status == 200
+    data = await resp.json()
+    assert "remaining_seconds" in data
+    assert data["remaining_seconds"] is not None
+    assert data["remaining_seconds"] > 0

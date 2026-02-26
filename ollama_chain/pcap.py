@@ -49,9 +49,14 @@ def analyze_pcap(filepath: str, max_packets: int = 50000) -> PcapAnalysis:
 
     try:
         packets = rdpcap(filepath, count=max_packets)
+    except KeyboardInterrupt:
+        raise
     except Exception as e:
         print(f"Error reading pcap: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if packets is None:
+        packets = []
 
     analysis = PcapAnalysis(filepath=filepath, total_packets=len(packets))
 
@@ -67,7 +72,6 @@ def analyze_pcap(filepath: str, max_packets: int = 50000) -> PcapAnalysis:
     tcp_flags_counter = Counter()
     ip_counter = Counter()
     conversation_counter = Counter()
-    sizes = []
     dns_queries = []
     errors = []
     warnings = []
@@ -75,9 +79,19 @@ def analyze_pcap(filepath: str, max_packets: int = 50000) -> PcapAnalysis:
     syn_seen = set()
     fin_seen = set()
 
+    size_min = float('inf')
+    size_max = 0
+    size_sum = 0
+    size_count = 0
+
     for i, pkt in enumerate(packets):
         size = len(pkt)
-        sizes.append(size)
+        size_sum += size
+        size_count += 1
+        if size < size_min:
+            size_min = size
+        if size > size_max:
+            size_max = size
 
         if pkt.haslayer(ARP):
             protocol_counter["ARP"] += 1
@@ -212,12 +226,12 @@ def analyze_pcap(filepath: str, max_packets: int = 50000) -> PcapAnalysis:
         for q, c in dns_counts.most_common(25)
     ]
 
-    if sizes:
+    if size_count:
         analysis.packet_sizes = {
-            "min": min(sizes),
-            "max": max(sizes),
-            "avg": round(sum(sizes) / len(sizes), 1),
-            "total_bytes": sum(sizes),
+            "min": size_min,
+            "max": size_max,
+            "avg": round(size_sum / size_count, 1),
+            "total_bytes": size_sum,
         }
 
     analysis.errors = errors[:100]

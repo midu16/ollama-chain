@@ -8,7 +8,6 @@ from ollama_chain.common import (
     _DEFAULT_KEEP_ALIVE,
     _SOURCE_MARKERS,
     SOURCE_GUIDANCE,
-    _thinking_cache,
     ask,
     build_structured_prompt,
     chat_with_retry,
@@ -27,7 +26,7 @@ from ollama_chain.common import (
 
 class TestModelSupportsThinking:
     def setup_method(self):
-        _thinking_cache.clear()
+        model_supports_thinking.cache_clear()
 
     @patch("ollama_chain.common.ollama_client")
     def test_thinking_model_via_api(self, mock_client):

@@ -1,9 +1,13 @@
 """Auto-discover and manage locally available Ollama models."""
 
 import sys
+import time
 from dataclasses import dataclass
 
 import ollama
+
+_model_cache: tuple[float, list["ModelInfo"]] | None = None
+_MODEL_CACHE_TTL = 30  # seconds
 
 
 @dataclass
@@ -38,8 +42,19 @@ def _get(obj, key, default=None):
     return getattr(obj, key, default)
 
 
-def discover_models() -> list[ModelInfo]:
-    """Query Ollama API and return sorted list of available models (smallest first)."""
+def discover_models(*, _force: bool = False) -> list[ModelInfo]:
+    """Query Ollama API and return sorted list of available models (smallest first).
+
+    Results are cached for ``_MODEL_CACHE_TTL`` seconds to avoid
+    redundant API calls when multiple callers query models in quick
+    succession (e.g. server health check + prompt submission).
+    """
+    global _model_cache
+    if not _force and _model_cache is not None:
+        ts, cached = _model_cache
+        if time.monotonic() - ts < _MODEL_CACHE_TTL:
+            return cached
+
     try:
         response = ollama.list()
     except Exception as e:
@@ -63,6 +78,7 @@ def discover_models() -> list[ModelInfo]:
         ))
 
     models.sort(key=lambda m: m.parameter_size)
+    _model_cache = (time.monotonic(), models)
     return models
 
 
@@ -93,13 +109,16 @@ def _get_memory_info() -> tuple[int, int]:
     try:
         with open("/proc/meminfo") as f:
             for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
                 if line.startswith("MemTotal:"):
-                    total = int(line.split()[1]) * 1024
+                    total = int(parts[1]) * 1024
                 elif line.startswith("MemAvailable:"):
-                    available = int(line.split()[1]) * 1024
+                    available = int(parts[1]) * 1024
                 if total and available:
                     break
-    except Exception:
+    except (OSError, ValueError, IndexError):
         pass
     return total, available
 

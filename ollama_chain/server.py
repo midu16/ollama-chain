@@ -7,12 +7,13 @@ Start with::
 
 Endpoints
 ---------
-POST   /api/prompt              Submit a prompt → {job_id, status, position}
-GET    /api/prompt/{job_id}     Poll job status → full job dict
-GET    /api/prompt/{job_id}/stream  SSE stream of progress + final result
-DELETE /api/prompt/{job_id}     Cancel a running/queued job
-GET    /api/models              List available Ollama models
-GET    /api/health              Server health + queue stats
+POST   /api/prompt                    Submit a prompt → {job_id, status, position}
+GET    /api/prompt/{job_id}           Poll job status → full job dict
+GET    /api/prompt/{job_id}/stream    SSE stream of progress + final result
+PATCH  /api/prompt/{job_id}/timeout   Extend running job deadline → {extended_by, remaining}
+DELETE /api/prompt/{job_id}           Cancel a running/queued job
+GET    /api/models                    List available Ollama models
+GET    /api/health                    Server health + queue stats
 
 Logging
 -------
@@ -39,6 +40,7 @@ logger = logging.getLogger("ollama_chain.server")
 scheduler = Scheduler()
 
 _SSE_HEARTBEAT_INTERVAL = 15  # seconds between keepalive comments
+_MAX_REQUEST_BODY = 64 * 1024  # 64 KB limit on JSON request bodies
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +92,7 @@ async def cors_middleware(request: web.Request, handler):
         return web.Response(
             headers={
                 "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+                "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
                 "Access-Control-Allow-Headers": "Content-Type",
             },
         )
@@ -146,6 +148,12 @@ async def health(request: web.Request) -> web.Response:
 
 
 async def submit_prompt(request: web.Request) -> web.Response:
+    if request.content_length and request.content_length > _MAX_REQUEST_BODY:
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=_MAX_REQUEST_BODY,
+            actual_size=request.content_length,
+            text="Request body too large",
+        )
     try:
         data = await request.json()
     except Exception:
@@ -170,7 +178,7 @@ async def submit_prompt(request: web.Request) -> web.Response:
     timeout = data.get("timeout", scheduler._default_job_timeout)
     if not isinstance(timeout, (int, float)) or timeout <= 0:
         timeout = scheduler._default_job_timeout
-    timeout = min(int(timeout), 3600)
+    timeout = max(int(timeout), 60)
 
     logger.info(
         "New prompt: mode=%s  web_search=%s  max_iter=%d  timeout=%ds  prompt=%.120s",
@@ -282,7 +290,8 @@ async def stream_job(request: web.Request) -> web.StreamResponse:
             last_write = now
             logger.debug("SSE heartbeat for job %s (%.0fs elapsed)", job_id, elapsed)
 
-        await asyncio.sleep(0.3)
+        sleep_interval = 1.0 if job.status == "queued" else 0.3
+        await asyncio.sleep(sleep_interval)
 
     while last_idx < len(job.progress):
         line = job.progress[last_idx]
@@ -312,6 +321,27 @@ async def stream_job(request: web.Request) -> web.StreamResponse:
     logger.info("SSE stream closed for job %s (final status=%s)", job_id, job.status)
     await response.write_eof()
     return response
+
+
+async def extend_job_timeout(request: web.Request) -> web.Response:
+    job_id = request.match_info["job_id"]
+    try:
+        data = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body")
+
+    extra = data.get("extend_by", 300)
+    if not isinstance(extra, (int, float)) or extra <= 0:
+        raise web.HTTPBadRequest(text="'extend_by' must be a positive number (seconds)")
+    extra = min(int(extra), 3600)
+
+    result = scheduler.extend_timeout(job_id, extra)
+    if result is None:
+        logger.debug("Extend failed for job %s (not running or not found)", job_id)
+        raise web.HTTPNotFound(text="Job not found or not running")
+
+    logger.info("Job %s timeout extended: %s", job_id, result)
+    return web.json_response({"job_id": job_id, **result})
 
 
 async def cancel_job(request: web.Request) -> web.Response:
@@ -357,12 +387,15 @@ async def on_shutdown(app: web.Application) -> None:
 
 def create_app(max_concurrent: int = 1,
                default_job_timeout: int = 600) -> web.Application:
-    scheduler._max_concurrent = max_concurrent
-    scheduler._default_job_timeout = default_job_timeout
-    scheduler._semaphore = asyncio.Semaphore(max_concurrent)
+    global scheduler
+    scheduler = Scheduler(
+        max_concurrent=max_concurrent,
+        default_job_timeout=default_job_timeout,
+    )
 
     app = web.Application(
         middlewares=[cors_middleware, request_logging_middleware],
+        client_max_size=_MAX_REQUEST_BODY,
     )
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
@@ -371,6 +404,7 @@ def create_app(max_concurrent: int = 1,
     app.router.add_post("/api/prompt", submit_prompt)
     app.router.add_get("/api/prompt/{job_id}", get_job)
     app.router.add_get("/api/prompt/{job_id}/stream", stream_job)
+    app.router.add_patch("/api/prompt/{job_id}/timeout", extend_job_timeout)
     app.router.add_delete("/api/prompt/{job_id}", cancel_job)
     app.router.add_get("/api/models", list_models)
 

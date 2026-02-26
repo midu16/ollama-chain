@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -21,6 +22,8 @@ from .search import (
     github_search, github_search_issues, stackoverflow_search,
     docs_search,
 )
+
+_WEB_TOOL_TIMEOUT = 20  # hard timeout for web search tool functions
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +54,9 @@ class Tool:
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+_MAX_SHELL_OUTPUT = 100_000  # 100 KB cap on shell command output
+
+
 def tool_shell(command: str, timeout: int = 30) -> ToolResult:
     """Execute a shell command and return combined stdout/stderr."""
     try:
@@ -58,9 +64,15 @@ def tool_shell(command: str, timeout: int = 30) -> ToolResult:
             command, shell=True, capture_output=True, text=True,
             timeout=timeout,
         )
-        output = result.stdout
-        if result.stderr:
-            output += f"\n[stderr] {result.stderr}"
+        stdout = result.stdout
+        stderr = result.stderr
+        if len(stdout) > _MAX_SHELL_OUTPUT:
+            stdout = stdout[:_MAX_SHELL_OUTPUT] + "\n... [output truncated]"
+        if len(stderr) > _MAX_SHELL_OUTPUT:
+            stderr = stderr[:_MAX_SHELL_OUTPUT] + "\n... [stderr truncated]"
+        output = stdout
+        if stderr:
+            output += f"\n[stderr] {stderr}"
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
         return ToolResult(
@@ -134,70 +146,80 @@ def tool_list_dir(path: str = ".") -> ToolResult:
         )
 
 
-def tool_web_search_tool(query: str) -> ToolResult:
-    """Search the web via DuckDuckGo."""
-    results = web_search(query, max_results=5)
-    formatted = format_search_results(results)
+def _run_search_with_timeout(fn, tool_name: str, *args, **kwargs) -> ToolResult:
+    """Run a search function with a hard timeout to prevent hanging."""
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(fn, *args, **kwargs)
+            results = future.result(timeout=_WEB_TOOL_TIMEOUT)
+    except TimeoutError:
+        return ToolResult(
+            False, f"Search timed out after {_WEB_TOOL_TIMEOUT}s", tool_name,
+            error_detail="timeout",
+        )
+    except Exception as e:
+        return ToolResult(
+            False, f"Search failed: {e}", tool_name,
+            error_detail=type(e).__name__,
+        )
+    formatted = format_search_results(results) if isinstance(results, list) else ""
     if not formatted:
         return ToolResult(
-            False, "No search results found.", "web_search",
+            False, "No results found.", tool_name,
             error_detail="empty_results",
         )
-    return ToolResult(True, formatted, "web_search")
+    return ToolResult(True, formatted, tool_name)
+
+
+def tool_web_search_tool(query: str) -> ToolResult:
+    """Search the web via DuckDuckGo."""
+    return _run_search_with_timeout(web_search, "web_search", query, max_results=5)
 
 
 def tool_web_search_news_tool(query: str) -> ToolResult:
     """Search recent news via DuckDuckGo."""
-    results = web_search_news(query, max_results=5)
-    formatted = format_search_results(results)
-    if not formatted:
-        return ToolResult(
-            False, "No news results found.", "web_search_news",
-            error_detail="empty_results",
-        )
-    return ToolResult(True, formatted, "web_search_news")
+    return _run_search_with_timeout(web_search_news, "web_search_news", query, max_results=5)
 
 
 def tool_github_search(query: str) -> ToolResult:
     """Search GitHub repositories and issues."""
-    repos = github_search(query, max_results=3)
-    issues = github_search_issues(query, max_results=3)
-    combined = repos + issues
-    formatted = format_search_results(combined)
-    if not formatted:
-        return ToolResult(
-            False, "No GitHub results found.", "github_search",
-            error_detail="empty_results",
-        )
-    return ToolResult(True, formatted, "github_search")
+    def _combined_github(q: str) -> list:
+        repos = github_search(q, max_results=3)
+        issues = github_search_issues(q, max_results=3)
+        return repos + issues
+    return _run_search_with_timeout(_combined_github, "github_search", query)
 
 
 def tool_stackoverflow_search(query: str) -> ToolResult:
     """Search Stack Overflow for Q&A."""
-    results = stackoverflow_search(query, max_results=5)
-    formatted = format_search_results(results)
-    if not formatted:
-        return ToolResult(
-            False, "No Stack Overflow results found.", "stackoverflow_search",
-            error_detail="empty_results",
-        )
-    return ToolResult(True, formatted, "stackoverflow_search")
+    return _run_search_with_timeout(stackoverflow_search, "stackoverflow_search", query, max_results=5)
 
 
 def tool_docs_search(query: str) -> ToolResult:
     """Search trusted documentation sites."""
-    results = docs_search(query, max_results=5)
-    formatted = format_search_results(results)
-    if not formatted:
-        return ToolResult(
-            False, "No documentation results found.", "docs_search",
-            error_detail="empty_results",
-        )
-    return ToolResult(True, formatted, "docs_search")
+    return _run_search_with_timeout(docs_search, "docs_search", query, max_results=5)
+
+
+_EVAL_BLOCKED_KEYWORDS = frozenset({
+    "import", "exec", "eval", "__import__", "compile",
+    "open", "globals", "locals", "getattr", "setattr", "delattr",
+    "__builtins__", "__class__", "__subclasses__",
+    "os.", "sys.", "subprocess", "shutil",
+})
 
 
 def tool_python_eval(code: str) -> ToolResult:
     """Evaluate a Python expression in a restricted namespace."""
+    code_lower = code.lower().replace(" ", "")
+    for blocked in _EVAL_BLOCKED_KEYWORDS:
+        if blocked.replace(" ", "") in code_lower:
+            return ToolResult(
+                False,
+                f"Blocked: '{blocked}' is not allowed in eval",
+                "python_eval",
+                error_detail="blocked_keyword",
+            )
+
     try:
         import math
 
@@ -212,7 +234,10 @@ def tool_python_eval(code: str) -> ToolResult:
         }
         namespace = {"__builtins__": allowed_builtins, "math": math}
         result = eval(code, namespace)
-        return ToolResult(True, str(result), "python_eval")
+        output = str(result)
+        if len(output) > 50_000:
+            output = output[:50_000] + "\n... [output truncated]"
+        return ToolResult(True, output, "python_eval")
     except Exception as e:
         return ToolResult(
             False, f"Error: {e}", "python_eval", error_detail=type(e).__name__,

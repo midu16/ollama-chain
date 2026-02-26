@@ -158,7 +158,7 @@ class TestDiscoverModels:
             ]
         }
         from ollama_chain.models import discover_models
-        models = discover_models()
+        models = discover_models(_force=True)
         assert len(models) == 2
         assert models[0].name == "qwen3:8b"  # sorted smallest first
         assert models[1].name == "qwen3:14b"
@@ -167,7 +167,7 @@ class TestDiscoverModels:
     def test_empty_models(self, mock_ollama):
         mock_ollama.list.return_value = {"models": []}
         from ollama_chain.models import discover_models
-        models = discover_models()
+        models = discover_models(_force=True)
         assert models == []
 
     @patch("ollama_chain.models.ollama")
@@ -176,7 +176,7 @@ class TestDiscoverModels:
             "models": [{"model": "test:1b", "size": 1000, "details": {}}]
         }
         from ollama_chain.models import discover_models
-        models = discover_models()
+        models = discover_models(_force=True)
         assert len(models) == 1
         assert models[0].quantization == "unknown"
 

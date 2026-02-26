@@ -23,6 +23,7 @@ from .common import (
     model_supports_thinking,
     sanitize_messages,
 )
+from .progress import progress_update
 from .memory import SessionMemory, PersistentMemory
 from .planner import (
     decompose_goal,
@@ -46,6 +47,7 @@ from .tools import (
 
 MAX_ITERATIONS = 15
 MAX_PARALLEL = 3
+_MAX_CONTEXT_CHARS = 32_000  # cap total context sent to models
 
 
 # ---------------------------------------------------------------------------
@@ -406,9 +408,16 @@ def _execute_step(
     )
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    for entry in session.history[-10:]:
+    total_chars = len(system_prompt)
+    history_entries = session.history[-10:]
+    for entry in history_entries:
         role = entry.role if entry.role in ("user", "assistant") else "assistant"
-        messages.append({"role": role, "content": entry.content})
+        content = entry.content
+        if total_chars + len(content) > _MAX_CONTEXT_CHARS:
+            remaining = max(200, _MAX_CONTEXT_CHARS - total_chars)
+            content = content[:remaining] + "\n... [context truncated]"
+        total_chars += len(content)
+        messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": step_prompt})
     messages = sanitize_messages(messages)
 
@@ -692,6 +701,7 @@ def run_agent(
         file=sys.stderr,
     )
     print(f"{'='*60}", file=sys.stderr)
+    progress_update(3, f"Planning with {fast_name}...")
     print(f"[agent] Planning with {fast_name}...", file=sys.stderr)
 
     plan = decompose_goal(
@@ -735,6 +745,12 @@ def run_agent(
 
         iteration += 1
 
+        total = len(session.plan)
+        completed = total - len(pending)
+        pct = 10 + (completed / max(total, 1)) * 75
+        step_desc = current_group[0].get("description", "")[:50]
+        progress_update(pct, f"Step {completed + 1}/{total}: {step_desc}...")
+
         answer = _execute_parallel_group(
             current_group, session, persistent, persistent_ctx,
             all_models, iteration, max_iterations,
@@ -758,15 +774,24 @@ def run_agent(
     # ---- Phase 3: Final synthesis -----------------------------------------
     _print_step_summary(session)
 
+    progress_update(85, f"Synthesizing final answer with {strong_name}...")
     print(
         f"[agent] Synthesizing final answer with {strong_name}...",
         file=sys.stderr,
     )
 
-    collected = "\n\n".join(
-        f"[Step {tr['step']} -- {tr['tool']}]\n{tr['output']}"
-        for tr in session.tool_results
-    )
+    collected_parts: list[str] = []
+    collected_size = 0
+    for tr in session.tool_results:
+        part = f"[Step {tr['step']} -- {tr['tool']}]\n{tr['output']}"
+        if collected_size + len(part) > _MAX_CONTEXT_CHARS:
+            remaining = max(200, _MAX_CONTEXT_CHARS - collected_size)
+            part = part[:remaining] + "\n... [truncated]"
+            collected_parts.append(part)
+            break
+        collected_parts.append(part)
+        collected_size += len(part)
+    collected = "\n\n".join(collected_parts)
     facts_block = "\n".join(f"- {f}" for f in session.facts) if session.facts else "None"
 
     final_prompt = build_structured_prompt(
@@ -845,8 +870,8 @@ def _record_tool_result(
     persistent: PersistentMemory,
 ):
     truncated = result.output
-    if len(truncated) > 3000:
-        truncated = truncated[:3000] + "\n... [truncated]"
+    if len(truncated) > 2000:
+        truncated = truncated[:2000] + "\n... [truncated]"
 
     status = "OK" if result.success else "FAILED"
     timing = f" [{result.duration_ms:.0f}ms]" if result.duration_ms else ""
@@ -868,6 +893,9 @@ def _record_tool_result(
         "duration_ms": result.duration_ms,
         "error_detail": result.error_detail,
     })
+    from .memory import _MAX_TOOL_RESULTS
+    if len(session.tool_results) > _MAX_TOOL_RESULTS:
+        session.tool_results = session.tool_results[-_MAX_TOOL_RESULTS:]
 
     step["status"] = "completed" if result.success else "failed"
 
@@ -892,6 +920,7 @@ def _synthesize_final(prompt: str, all_models: list[str]) -> str:
     n = len(all_models)
 
     # --- Stage 1: first model drafts (no thinking — speed) ---
+    progress_update(86, f"Cascade synthesis 1/{n}: drafting with {all_models[0]}...")
     print(
         f"[agent]   Cascade synthesis 1/{n}: drafting with {all_models[0]}...",
         file=sys.stderr,
@@ -912,6 +941,7 @@ def _synthesize_final(prompt: str, all_models: list[str]) -> str:
 
     # --- Stages 2..N-1: intermediate models refine (thinking + low temp) ---
     for i, model in enumerate(all_models[1:-1], start=2):
+        progress_update(86 + (i - 1) / n * 9, f"Cascade synthesis {i}/{n}: refining with {model}...")
         print(
             f"[agent]   Cascade synthesis {i}/{n}: refining with {model} +think...",
             file=sys.stderr,
@@ -937,6 +967,7 @@ def _synthesize_final(prompt: str, all_models: list[str]) -> str:
             print(f"[agent]   {model} unavailable ({e}), skipping...", file=sys.stderr)
 
     # --- Final stage: strongest model produces definitive answer ---
+    progress_update(93, f"Cascade synthesis {n}/{n}: final with {all_models[-1]}...")
     print(
         f"[agent]   Cascade synthesis {n}/{n}: final answer with {all_models[-1]} +think...",
         file=sys.stderr,

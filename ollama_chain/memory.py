@@ -7,11 +7,17 @@ Provides two layers:
 """
 
 import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 MEMORY_DIR = Path.home() / ".ollama_chain"
+
+_MAX_HISTORY_ENTRIES = 200
+_MAX_TOOL_RESULTS = 100
+_MAX_FACTS = 100
 
 
 # ---------------------------------------------------------------------------
@@ -50,10 +56,15 @@ class SessionMemory:
 
     # -- Core add methods --
 
+    def _trim_history(self) -> None:
+        if len(self.history) > _MAX_HISTORY_ENTRIES:
+            self.history = self.history[-_MAX_HISTORY_ENTRIES:]
+
     def add(self, role: str, content: str, **metadata):
         self.history.append(
             MemoryEntry(role=role, content=content, metadata=metadata)
         )
+        self._trim_history()
 
     def add_tool_output(
         self, tool_name: str, output: str, step_id: int, success: bool,
@@ -65,9 +76,12 @@ class SessionMemory:
             metadata={"tool": tool_name, "step_id": step_id, "success": success},
             tags=["tool_result", tool_name],
         ))
+        self._trim_history()
 
     def add_fact(self, fact: str):
         if fact not in self.facts:
+            if len(self.facts) >= _MAX_FACTS:
+                self.facts = self.facts[-(_MAX_FACTS - 1):]
             self.facts.append(fact)
             self.history.append(MemoryEntry(
                 role="assistant",
@@ -75,6 +89,7 @@ class SessionMemory:
                 content_type=CONTENT_FACT,
                 tags=["fact"],
             ))
+            self._trim_history()
 
     def add_error(self, error: str, step_id: int | None = None):
         self.history.append(MemoryEntry(
@@ -84,6 +99,7 @@ class SessionMemory:
             metadata={"step_id": step_id},
             tags=["error"],
         ))
+        self._trim_history()
 
     # -- Context retrieval (Gap 2 & 6: proper LLM-ready context) --
 
@@ -273,7 +289,27 @@ class PersistentMemory:
         return default if default is not None else {}
 
     def _save(self, path: Path, data):
-        path.write_text(json.dumps(data, indent=2, default=str))
+        content = json.dumps(data, indent=2, default=str)
+        fd = None
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=str(self.memory_dir), suffix=".tmp")
+            os.write(fd, content.encode("utf-8"))
+            os.close(fd)
+            fd = None
+            os.replace(tmp, str(path))
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            raise
 
     def store_fact(self, fact: str):
         if fact not in self._facts:

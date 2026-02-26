@@ -18,8 +18,8 @@ export interface RunResult {
 const SSE_MAX_RECONNECTS = 3;
 const SSE_RECONNECT_BASE_MS = 2000;
 const POLL_INTERVAL_MS = 2000;
-const POLL_MAX_ATTEMPTS = 600;
-const SSE_IDLE_TIMEOUT_MS = 120_000; // 2 minutes without any data → reconnect
+const POLL_MAX_ATTEMPTS = 10800; // ~6 hours at 2s intervals — no artificial ceiling
+const SSE_IDLE_TIMEOUT_MS = 660_000; // 11 minutes without any SSE data → reconnect (must exceed server-side agent idle limit of 600s)
 
 export class OllamaChainRunner {
     private outputChannel: vscode.OutputChannel;
@@ -176,6 +176,23 @@ export class OllamaChainRunner {
         });
     }
 
+    async extendTimeout(extraSeconds: number = 300): Promise<{ extended_by: number; remaining: number; timeout: number } | null> {
+        if (!this._currentJobId) { return null; }
+        const cfg = this.getConfig();
+        const base = cfg.apiUrl.replace(/\/+$/, '');
+        const result = await this.httpPatch(
+            `${base}/api/prompt/${this._currentJobId}/timeout`,
+            { extend_by: extraSeconds },
+        );
+        if (result.success && result.data) {
+            this.outputChannel.appendLine(
+                `[api] Timeout extended by ${result.data.extended_by}s — ${result.data.remaining}s remaining`,
+            );
+            return result.data;
+        }
+        return null;
+    }
+
     showOutput(): void {
         this.outputChannel.show(true);
     }
@@ -187,8 +204,9 @@ export class OllamaChainRunner {
 
     // ── Private helpers ────────────────────────────────────────────────
 
-    private httpPost(
+    private httpRequest(
         url: string,
+        method: string,
         data: Record<string, unknown>,
     ): Promise<{ success: boolean; data?: any; error?: string }> {
         return new Promise((resolve) => {
@@ -200,7 +218,7 @@ export class OllamaChainRunner {
                     hostname: parsed.hostname,
                     port: parsed.port || undefined,
                     path: parsed.pathname,
-                    method: 'POST',
+                    method,
                     headers: {
                         'Content-Type': 'application/json',
                         'Content-Length': Buffer.byteLength(body),
@@ -232,6 +250,20 @@ export class OllamaChainRunner {
             req.write(body);
             req.end();
         });
+    }
+
+    private httpPost(
+        url: string,
+        data: Record<string, unknown>,
+    ): Promise<{ success: boolean; data?: any; error?: string }> {
+        return this.httpRequest(url, 'POST', data);
+    }
+
+    private httpPatch(
+        url: string,
+        data: Record<string, unknown>,
+    ): Promise<{ success: boolean; data?: any; error?: string }> {
+        return this.httpRequest(url, 'PATCH', data);
     }
 
     private settleFromJobStatus(status: any): RunResult {

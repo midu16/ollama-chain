@@ -87,25 +87,25 @@ _TECHNICAL_TERMS = frozenset({
     "authentication", "authorization", "oauth", "jwt", "rbac",
 })
 
-_STRUCTURAL_MARKERS = (
+_STRUCTURAL_MARKERS = tuple(re.compile(p, re.MULTILINE) for p in (
     r"^\d+[\.\)]\s",        # numbered list
     r"^[-*]\s",             # bullet points
     r"^#{1,6}\s",           # markdown headers
     r"\n\n",                # paragraph breaks
     r"```",                 # code blocks
     r":\s*\n",              # key-value style
-)
+))
 
-_CONSTRAINT_PATTERNS = (
+_CONSTRAINT_PATTERNS = tuple(re.compile(p) for p in (
     r"\b(must|should|shall|require|need to|has to|ensure)\b",
     r"\b(at least|at most|no more than|no less than|exactly|within)\b",
     r"\b(maximum|minimum|limit|constraint|restrict|bound)\b",
     r"\b(format|output|return|respond|reply)\b.{0,20}\b(as|in|with|using)\b",
     r"\b(step[- ]by[- ]step|one by one|sequentially|in order)\b",
     r"\b(include|exclude|avoid|do not|don't|never|always)\b",
-)
+))
 
-_DELIMITER_PATTERNS = (
+_DELIMITER_PATTERNS = tuple(re.compile(p, re.MULTILINE) for p in (
     r"===",                   # section delimiters
     r"---",                   # horizontal rules
     r"```",                   # code fences
@@ -113,29 +113,29 @@ _DELIMITER_PATTERNS = (
     r"\|.*\|.*\|",           # table-style pipes
     r"^\s*#{1,6}\s",         # markdown headers as section delimiters
     r'"""',                   # triple-quote blocks
-)
+))
 
-_COT_PATTERNS = (
+_COT_PATTERNS = tuple(re.compile(p) for p in (
     r"\b(step[- ]by[- ]step|think.*through|reason.*through|show.*reasoning)\b",
     r"\b(let'?s think|walk.*through|break.*down|work.*through)\b",
     r"\b(first.*then.*finally|explain.*reasoning|show.*work)\b",
     r"\b(why.*because|derive|prove|logical|implication)\b",
-)
+))
 
-_FEW_SHOT_PATTERNS = (
+_FEW_SHOT_PATTERNS = tuple(re.compile(p, re.MULTILINE | re.DOTALL) for p in (
     r"\b(example|e\.g\.|for instance|such as|sample|demo)\b",
     r"(input|output)\s*:",
     r"(q|question|query)\s*:.*\n.*(a|answer|response)\s*:",
     r"```\w*\n.*```",         # code blocks act as examples
-)
+))
 
-_DECOMPOSITION_PATTERNS = (
+_DECOMPOSITION_PATTERNS = tuple(re.compile(p, re.MULTILINE) for p in (
     r"^\s*\d+[\.\)]\s",       # numbered steps
     r"\b(first|second|third|then|next|finally|lastly)\b",
     r"\b(step\s*\d|phase\s*\d|part\s*\d)\b",
     r"\b(break.*down|decompose|sub-?tasks?|subtasks?)\b",
     r"\b(and also|additionally|furthermore|moreover)\b",
-)
+))
 
 
 def _score_clarity(prompt: str, words: list[str]) -> MetricScore:
@@ -225,8 +225,8 @@ def _score_structure(prompt: str, words: list[str]) -> MetricScore:
     score = 0.4
     markers_found = 0
 
-    for pattern in _STRUCTURAL_MARKERS:
-        if re.search(pattern, prompt, re.MULTILINE):
+    for compiled in _STRUCTURAL_MARKERS:
+        if compiled.search(prompt):
             markers_found += 1
 
     if markers_found >= 3:
@@ -263,8 +263,8 @@ def _score_actionability(prompt: str, words: list[str]) -> MetricScore:
     prompt_lower = prompt.lower()
 
     constraint_count = 0
-    for pattern in _CONSTRAINT_PATTERNS:
-        matches = re.findall(pattern, prompt_lower)
+    for compiled in _CONSTRAINT_PATTERNS:
+        matches = compiled.findall(prompt_lower)
         constraint_count += len(matches)
 
     if constraint_count >= 4:
@@ -350,8 +350,8 @@ def _score_delimiter_usage(prompt: str, words: list[str]) -> MetricScore:
     word_count = len(words)
     delimiter_count = 0
 
-    for pattern in _DELIMITER_PATTERNS:
-        if re.search(pattern, prompt, re.MULTILINE):
+    for compiled in _DELIMITER_PATTERNS:
+        if compiled.search(prompt):
             delimiter_count += 1
 
     if word_count < 15:
@@ -396,8 +396,8 @@ def _score_cot_readiness(prompt: str, words: list[str]) -> MetricScore:
     ))
 
     cot_signals = 0
-    for pattern in _COT_PATTERNS:
-        if re.search(pattern, prompt_lower):
+    for compiled in _COT_PATTERNS:
+        if compiled.search(prompt_lower):
             cot_signals += 1
 
     if not needs_reasoning:
@@ -437,8 +437,8 @@ def _score_few_shot_readiness(prompt: str, words: list[str]) -> MetricScore:
     ))
 
     example_signals = 0
-    for pattern in _FEW_SHOT_PATTERNS:
-        if re.search(pattern, prompt_lower, re.MULTILINE | re.DOTALL):
+    for compiled in _FEW_SHOT_PATTERNS:
+        if compiled.search(prompt_lower):
             example_signals += 1
 
     if not needs_examples:
@@ -478,8 +478,8 @@ def _score_task_decomposition(prompt: str, words: list[str]) -> MetricScore:
     )
 
     decomp_signals = 0
-    for pattern in _DECOMPOSITION_PATTERNS:
-        if re.search(pattern, prompt_lower, re.MULTILINE):
+    for compiled in _DECOMPOSITION_PATTERNS:
+        if compiled.search(prompt_lower):
             decomp_signals += 1
 
     if not is_complex:

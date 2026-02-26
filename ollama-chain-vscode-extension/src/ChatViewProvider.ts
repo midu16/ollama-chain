@@ -51,6 +51,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'showOutput':
                     this.runner.showOutput();
                     break;
+                case 'extendTimeout':
+                    await this.handleExtendTimeout(msg.extraSeconds);
+                    break;
+                case 'retryWithTimeout':
+                    await this.handlePrompt(msg.prompt, { ...msg.options, timeout: msg.newTimeout });
+                    break;
                 case 'insertCode':
                     this.insertCodeAtCursor(msg.code);
                     break;
@@ -195,15 +201,50 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         this.endSession();
 
+        const isTimeout = result.stderr?.includes('timed out');
+
         if (result.success && result.output) {
             if (result.stderr) {
                 this.addMessage('status', result.stderr);
             }
             this.addMessage('assistant', result.output, options.mode);
+            if (isTimeout) {
+                this.postMessage({
+                    type: 'timeoutRetry',
+                    prompt,
+                    options,
+                    currentTimeout: options.timeout,
+                    hasPartial: true,
+                });
+            }
         } else if (!result.success) {
             this.addMessage('error', result.stderr || 'Unknown error occurred.');
+            if (isTimeout) {
+                this.postMessage({
+                    type: 'timeoutRetry',
+                    prompt,
+                    options,
+                    currentTimeout: options.timeout,
+                    hasPartial: false,
+                });
+            }
         } else {
             this.addMessage('assistant', '(empty response)');
+        }
+    }
+
+    private async handleExtendTimeout(extraSeconds: number = 300): Promise<void> {
+        const result = await this.runner.extendTimeout(extraSeconds);
+        if (result) {
+            this.postMessage({
+                type: 'progress',
+                line: `Timeout extended by ${result.extended_by}s — ${result.remaining}s remaining`,
+            });
+        } else {
+            this.postMessage({
+                type: 'progress',
+                line: 'Could not extend timeout (job may have finished)',
+            });
         }
     }
 
@@ -389,6 +430,53 @@ body {
     color: var(--vscode-descriptionForeground);
     flex-shrink: 0;
 }
+
+.extend-btn {
+    font-size: 11px;
+    padding: 2px 8px;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.extend-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+
+/* ── Timeout Retry ── */
+
+.timeout-retry {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 12px;
+    font-size: 11px;
+    border-top: 1px solid var(--vscode-panel-border);
+    background: var(--vscode-inputValidation-warningBackground, rgba(255,200,0,0.08));
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+.timeout-retry-btn {
+    font-size: 11px;
+    padding: 3px 10px;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.timeout-retry-btn:hover { background: var(--vscode-button-hoverBackground); }
+
+.timeout-retry-btn.secondary {
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+}
+
+.timeout-retry-btn.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
 
 /* ── Chat ── */
 
@@ -694,6 +782,11 @@ body {
             <input type="checkbox" id="webSearchCheck" checked>
             <label for="webSearchCheck">Web search</label>
         </div>
+        <div class="setting-row">
+            <label for="timeoutInput">Timeout</label>
+            <input type="number" id="timeoutInput" min="60" step="60" value="600">
+            <span style="font-size:11px;color:var(--vscode-descriptionForeground);flex-shrink:0">sec</span>
+        </div>
         <div class="setting-row" id="iterationsRow" style="display:none">
             <label for="maxIter">Iterations</label>
             <input type="number" id="maxIter" min="1" max="50" value="15">
@@ -706,7 +799,10 @@ body {
         <span class="session-dot"></span>
         <span>Session active &mdash; API</span>
     </div>
-    <span class="session-timer" id="sessionTimer">00:00</span>
+    <div style="display:flex;align-items:center;gap:8px">
+        <button class="extend-btn" id="extendBtn" title="Add 5 minutes to the timeout">+5 min</button>
+        <span class="session-timer" id="sessionTimer">00:00</span>
+    </div>
 </div>
 
 <div class="chat-area" id="chatArea">
@@ -721,6 +817,7 @@ body {
 </div>
 
 <div class="progress-bar" id="progressBar"></div>
+<div class="timeout-retry" id="timeoutRetry" style="display:none"></div>
 
 <div class="input-area">
     <div class="input-row">

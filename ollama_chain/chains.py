@@ -1,10 +1,12 @@
 """Chaining modes — orchestrate all local models with web search and source citation."""
 
 import sys
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from .common import SOURCE_GUIDANCE, ask, model_supports_thinking
 from .pcap import analyze_pcap, format_analysis as format_pcap_analysis
 from .k8s import analyze_cluster, format_analysis as format_k8s_analysis
+from .progress import progress_update
 from .router import build_fallback_chain, route_query
 from .search import search_for_query
 
@@ -14,12 +16,34 @@ CLI_ONLY_MODES = frozenset({"pcap", "k8s"})
 _TEMP_REVIEW = 0.4
 _TEMP_FINAL = 0.3
 
+_SEARCH_ENRICH_TIMEOUT = 45  # hard ceiling for _enrich_with_search
+
 
 def _enrich_with_search(query: str, fast: str, web_search: bool) -> str:
-    """If web search is enabled, fetch results and return a context block."""
+    """If web search is enabled, fetch results and return a context block.
+
+    Wrapped in a hard timeout so the answer pipeline is never blocked
+    indefinitely by search failures.
+    """
     if not web_search:
         return ""
-    results = search_for_query(query, fast)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(search_for_query, query, fast)
+            results = future.result(timeout=_SEARCH_ENRICH_TIMEOUT)
+    except TimeoutError:
+        print(
+            f"[search] Search pipeline timed out after {_SEARCH_ENRICH_TIMEOUT}s, "
+            f"proceeding without search results",
+            file=sys.stderr,
+        )
+        return ""
+    except Exception as e:
+        print(
+            f"[search] Search pipeline failed ({e}), proceeding without search results",
+            file=sys.stderr,
+        )
+        return ""
     if not results:
         return ""
     return (
@@ -62,8 +86,11 @@ def chain_cascade(
     fails, the system falls back to the next available model.
     """
     fast_name = fast or all_models[0]
-    search_ctx = _enrich_with_search(query, fast_name, web_search)
     n = len(all_models)
+    _pct_step = 85.0 / max(n, 1)
+
+    progress_update(2, "Searching web, GitHub, StackOverflow, Docs..." if web_search else "Preparing...")
+    search_ctx = _enrich_with_search(query, fast_name, web_search)
     skipped: list[str] = []
 
     review_think = complexity not in ("simple", "moderate")
@@ -79,6 +106,7 @@ def chain_cascade(
 
     current_answer: str | None = None
     for draft_model in all_models:
+        progress_update(10, f"Drafting with {draft_model}...")
         print(f"[cascade 1/{n}] Drafting with {draft_model}...", file=sys.stderr)
         try:
             current_answer = ask(enriched_draft, model=draft_model)
@@ -109,6 +137,8 @@ def chain_cascade(
     ]
     think_label = " +think" if review_think else ""
     for i, model in enumerate(review_models, start=2):
+        _idx = all_models.index(model) if model in all_models else i - 1
+        progress_update(10 + _pct_step * _idx, f"Reviewing with {model}{think_label}...")
         print(
             f"[cascade {i}/{n}] Reviewing with {model}{think_label}...",
             file=sys.stderr,
@@ -165,6 +195,7 @@ def chain_cascade(
     for final_model in final_models:
         if final_model in skipped:
             continue
+        progress_update(10 + _pct_step * (n - 1), f"Final answer with {final_model}{think_label}...")
         print(
             f"[cascade {n}/{n}] Final answer with {final_model}{think_label}...",
             file=sys.stderr,
@@ -211,6 +242,8 @@ def chain_route(
     strong_name = all_models[-1]
     search_ctx = _enrich_with_search(query, fast_name, web_search)
 
+    progress_update(5, "Searching..." if web_search else "Preparing...")
+    progress_update(20, f"Classifying complexity with {fast_name}...")
     print(f"[route 1/2] Classifying with {fast_name}...", file=sys.stderr)
     verdict = ask(
         f"Rate the complexity of answering this query on a scale of 1-5. "
@@ -230,9 +263,11 @@ def chain_route(
     )
 
     if score <= 3:
+        progress_update(50, f"Answering with {fast_name} (simple)...")
         print(f"[route 2/2] Answering with {fast_name} (simple)...", file=sys.stderr)
         return ask(enriched, model=fast_name)
     else:
+        progress_update(50, f"Answering with {strong_name} +think (complex)...")
         print(f"[route 2/2] Answering with {strong_name} +think (complex)...", file=sys.stderr)
         return ask(enriched, model=strong_name, thinking=True, temperature=_TEMP_FINAL)
 
@@ -246,18 +281,22 @@ def chain_pipeline(
     strong_name = all_models[-1]
     search_ctx = _enrich_with_search(query, fast_name, web_search)
 
+    progress_update(5, "Searching..." if web_search else "Preparing...")
+    progress_update(15, f"Extracting key points with {fast_name}...")
     print(f"[pipeline 1/3] Extracting key points with {fast_name}...", file=sys.stderr)
     key_points = ask(
         f"Extract the key points and core question from this. Be concise:\n\n{query}",
         model=fast_name,
     )
 
+    progress_update(35, f"Classifying domain with {fast_name}...")
     print(f"[pipeline 2/3] Classifying domain with {fast_name}...", file=sys.stderr)
     domain = ask(
         f"What domain/field is this about? Reply in 1-3 words:\n\n{key_points}",
         model=fast_name,
     )
 
+    progress_update(55, f"Deep analysis with {strong_name} +think ({domain.strip()})...")
     print(f"[pipeline 3/3] Deep analysis with {strong_name} +think ({domain.strip()})...", file=sys.stderr)
     prompt = (
         f"You are an expert in {domain}.\n"
@@ -281,9 +320,12 @@ def chain_verify(
     strong_name = all_models[-1]
     search_ctx = _enrich_with_search(query, fast_name, web_search)
 
+    progress_update(5, "Searching..." if web_search else "Preparing...")
+    progress_update(20, f"Drafting with {fast_name}...")
     print(f"[verify 1/2] Drafting with {fast_name}...", file=sys.stderr)
     draft = ask(f"{SOURCE_GUIDANCE}\n\n{query}", model=fast_name)
 
+    progress_update(50, f"Verifying with {strong_name} +think...")
     print(f"[verify 2/2] Verifying with {strong_name} +think...", file=sys.stderr)
     prompt = (
         f"Another model answered the following question. "
@@ -308,13 +350,16 @@ def chain_consensus(
     strong_name = all_models[-1]
     search_ctx = _enrich_with_search(query, fast_name, web_search)
 
+    progress_update(5, "Searching..." if web_search else "Preparing...")
     sourced_query = f"{SOURCE_GUIDANCE}\n\n{query}"
     answers = []
+    _n = len(all_models)
     for i, model in enumerate(all_models, 1):
         use_thinking = model_supports_thinking(model) and model != fast_name
         label = " +think" if use_thinking else ""
+        progress_update(10 + (i - 1) / max(_n, 1) * 60, f"Answer from {model}{label}...")
         print(
-            f"[consensus {i}/{len(all_models) + 1}] Answer from {model}{label}...",
+            f"[consensus {i}/{_n + 1}] Answer from {model}{label}...",
             file=sys.stderr,
         )
         answers.append((model, ask(sourced_query, model=model, thinking=use_thinking)))
@@ -324,6 +369,7 @@ def chain_consensus(
         for name, answer in answers
     )
 
+    progress_update(75, f"Merging consensus with {strong_name} +think...")
     print(
         f"[consensus {len(all_models) + 1}/{len(all_models) + 1}] "
         f"Merging with {strong_name} +think...",
@@ -351,15 +397,18 @@ def chain_search(
     """Search-first mode: always searches, strongest model synthesizes."""
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
+    progress_update(5, "Searching web, GitHub, StackOverflow, Docs...")
     results = search_for_query(query, fast_name)
 
     if not results:
+        progress_update(40, f"No results, answering with {strong_name} +think...")
         print("[search] No results found, falling back to strong model +think...", file=sys.stderr)
         return ask(
             f"{SOURCE_GUIDANCE}\n\n{query}", model=strong_name,
             thinking=True, temperature=_TEMP_FINAL,
         )
 
+    progress_update(40, f"Synthesizing answer with {strong_name} +think...")
     print(f"[search] Synthesizing answer with {strong_name} +think...", file=sys.stderr)
     return ask(
         f"Answer the following question using the web search results below. "
@@ -383,6 +432,7 @@ def chain_fast(
     """Direct to fast model, optionally with search context."""
     fast_name = fast or all_models[0]
     search_ctx = _enrich_with_search(query, fast_name, web_search)
+    progress_update(20, f"Answering with {fast_name}...")
     print(f"[fast 1/1] {fast_name}...", file=sys.stderr)
     return ask(
         _inject_search_context(f"{SOURCE_GUIDANCE}\n\n{query}", search_ctx),
@@ -398,6 +448,8 @@ def chain_strong(
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
     search_ctx = _enrich_with_search(query, fast_name, web_search)
+    progress_update(5, "Searching..." if web_search else "Preparing...")
+    progress_update(20, f"Answering with {strong_name} +think...")
     print(f"[strong 1/1] {strong_name} +think...", file=sys.stderr)
     return ask(
         _inject_search_context(f"{SOURCE_GUIDANCE}\n\n{query}", search_ctx),
@@ -424,6 +476,7 @@ def chain_pcap(
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
 
+    progress_update(2, f"Parsing {filepath} with scapy...")
     print(f"[pcap 1/4] Parsing {filepath} with scapy...", file=sys.stderr)
     analysis = analyze_pcap(filepath)
     report = format_pcap_analysis(analysis)
@@ -451,6 +504,7 @@ def chain_pcap(
             search_query = " ".join(list(error_types)[:2])
             search_ctx = _enrich_with_search(search_query, fast_name, True)
 
+    progress_update(25, f"Summarizing with {fast_name}...")
     print(f"[pcap 2/4] Summarizing with {fast_name}...", file=sys.stderr)
     summary = ask(
         f"You are a network analyst. Summarize this packet capture analysis. "
@@ -459,6 +513,7 @@ def chain_pcap(
         model=fast_name,
     )
 
+    progress_update(45, f"Error analysis with {fast_name}...")
     print(f"[pcap 3/4] Error analysis with {fast_name}...", file=sys.stderr)
     if analysis.errors or analysis.warnings:
         error_details = "\n".join(analysis.errors + analysis.warnings)
@@ -481,6 +536,7 @@ def chain_pcap(
             f"Make sure to address their question directly.\n"
         )
 
+    progress_update(65, f"Expert report with {strong_name} +think...")
     print(f"[pcap 4/4] Expert report with {strong_name} +think...", file=sys.stderr)
     prompt = (
         f"You are a senior network engineer and security analyst. "
@@ -524,6 +580,7 @@ def chain_k8s(
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
 
+    progress_update(2, f"Gathering cluster state from {kubeconfig}...")
     print(f"[k8s 1/4] Gathering cluster state from {kubeconfig}...", file=sys.stderr)
     analysis = analyze_cluster(kubeconfig)
     report = format_k8s_analysis(analysis)
@@ -556,6 +613,7 @@ def chain_k8s(
             search_query = " ".join(search_terms[:2])
             search_ctx = _enrich_with_search(search_query, fast_name, True)
 
+    progress_update(25, f"Summarizing with {fast_name}...")
     print(f"[k8s 2/4] Summarizing with {fast_name}...", file=sys.stderr)
     summary = ask(
         f"You are a Kubernetes / OpenShift platform engineer. "
@@ -565,6 +623,7 @@ def chain_k8s(
         model=fast_name,
     )
 
+    progress_update(45, f"Issue analysis with {fast_name}...")
     print(f"[k8s 3/4] Issue analysis with {fast_name}...", file=sys.stderr)
     if analysis.errors or analysis.warnings:
         issue_details = "\n".join(analysis.errors + analysis.warnings)
@@ -588,6 +647,7 @@ def chain_k8s(
             f"Make sure to address their question directly.\n"
         )
 
+    progress_update(65, f"Expert report with {strong_name} +think...")
     print(f"[k8s 4/4] Expert report with {strong_name} +think...", file=sys.stderr)
     prompt = (
         f"You are a senior {platform} platform engineer and SRE specialist. "

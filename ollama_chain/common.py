@@ -2,6 +2,7 @@
 
 import sys
 import time
+from functools import lru_cache
 
 import ollama as ollama_client
 
@@ -32,29 +33,21 @@ _DEFAULT_KEEP_ALIVE = "15m"
 # Model capability detection
 # ---------------------------------------------------------------------------
 
-_thinking_cache: dict[str, bool] = {}
-
-
+@lru_cache(maxsize=64)
 def model_supports_thinking(model: str) -> bool:
     """Check whether *model* supports thinking / chain-of-thought mode.
 
     Queries `ollama.show()` for the ``capabilities`` list and caches the
-    result.  Falls back to name-based heuristics if the API call fails.
+    result (up to 64 models).  Falls back to name-based heuristics if
+    the API call fails.
     """
-    if model in _thinking_cache:
-        return _thinking_cache[model]
-
-    supports = False
     try:
         info = ollama_client.show(model)
         caps = getattr(info, "capabilities", None) or []
-        supports = "thinking" in caps
+        return "thinking" in caps
     except Exception:
         name = model.lower().split(":")[0]
-        supports = any(f in name for f in ("qwen3", "deepseek-r1", "qwq"))
-
-    _thinking_cache[model] = supports
-    return supports
+        return any(f in name for f in ("qwen3", "deepseek-r1", "qwq"))
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +95,15 @@ def sanitize_messages(messages: list[dict]) -> list[dict]:
 
     Ollama (and many chat-format models) expects strictly alternating
     user/assistant turns.  Adjacent entries with the same role are
-    concatenated.
+    concatenated.  Entries missing role or content are skipped.
     """
     if not messages:
         return messages
-    merged: list[dict] = [messages[0].copy()]
-    for msg in messages[1:]:
+    valid = [m for m in messages if m.get("role") and m.get("content")]
+    if not valid:
+        return []
+    merged: list[dict] = [valid[0].copy()]
+    for msg in valid[1:]:
         if msg["role"] == merged[-1]["role"]:
             merged[-1]["content"] += "\n\n" + msg["content"]
         else:
@@ -150,6 +146,11 @@ def ask(
     Lower values (0.3-0.4) improve factual accuracy; higher values
     (0.7-0.9) encourage creativity.
     """
+    if not prompt or not prompt.strip():
+        return ""
+    if not model:
+        raise ValueError("model name is required")
+
     can_think = model_supports_thinking(model)
     if can_think and not thinking:
         prompt = "/no_think\n" + prompt
@@ -163,7 +164,7 @@ def ask(
         messages=[{"role": "user", "content": prompt}],
         options=options,
     )
-    content = response["message"]["content"]
+    content = response.get("message", {}).get("content", "")
     if "<think>" in content:
         end = content.find("</think>")
         if end != -1:
