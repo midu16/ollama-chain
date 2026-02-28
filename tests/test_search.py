@@ -10,6 +10,10 @@ from ollama_chain.search import (
     TRUSTED_DOCS_DOMAINS,
     _SOURCE_LABELS,
     format_search_results,
+    generate_search_queries,
+    search_for_query,
+    web_search_news,
+    github_search_issues,
 )
 
 
@@ -209,3 +213,170 @@ class TestDocsSearch:
 
         scoped = mock_ddgs.text.call_args[0][0]
         assert "site:" in scoped
+
+
+# ---------------------------------------------------------------------------
+# web_search_news (mocked)
+# ---------------------------------------------------------------------------
+
+class TestWebSearchNews:
+    @patch("ollama_chain.search.DDGS")
+    def test_returns_news_results(self, mock_ddgs_cls):
+        mock_ddgs = MagicMock()
+        mock_ddgs.news.return_value = [
+            {"title": "Breaking", "url": "http://n.com", "body": "News body"},
+        ]
+        mock_ddgs_cls.return_value = mock_ddgs
+
+        results = web_search_news("test")
+        assert len(results) == 1
+        assert results[0].source == "news"
+        assert results[0].title == "Breaking"
+
+    @patch("ollama_chain.search.DDGS")
+    def test_handles_exception(self, mock_ddgs_cls):
+        mock_ddgs_cls.side_effect = Exception("fail")
+        results = web_search_news("test")
+        assert results == []
+
+    @patch("ollama_chain.search.DDGS")
+    def test_empty_results(self, mock_ddgs_cls):
+        mock_ddgs = MagicMock()
+        mock_ddgs.news.return_value = []
+        mock_ddgs_cls.return_value = mock_ddgs
+        results = web_search_news("test")
+        assert results == []
+
+
+# ---------------------------------------------------------------------------
+# github_search_issues (mocked)
+# ---------------------------------------------------------------------------
+
+class TestGithubSearchIssues:
+    @patch("ollama_chain.search.urllib.request.urlopen")
+    def test_returns_issues(self, mock_urlopen):
+        data = {
+            "items": [{
+                "title": "Bug: crash on start",
+                "html_url": "https://github.com/user/repo/issues/1",
+                "state": "open",
+                "comments": 5,
+                "labels": [{"name": "bug"}],
+                "body": "Crash description here",
+            }]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(data).encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        results = github_search_issues("crash bug")
+        assert len(results) == 1
+        assert results[0].source == "github-issues"
+        assert "open" in results[0].snippet
+        assert "bug" in results[0].snippet
+
+    @patch("ollama_chain.search.urllib.request.urlopen")
+    def test_handles_exception(self, mock_urlopen):
+        mock_urlopen.side_effect = Exception("timeout")
+        assert github_search_issues("test") == []
+
+
+# ---------------------------------------------------------------------------
+# generate_search_queries (mocked LLM)
+# ---------------------------------------------------------------------------
+
+class TestGenerateSearchQueries:
+    @patch("ollama_chain.common.chat_with_retry")
+    def test_generates_queries(self, mock_chat):
+        mock_chat.return_value = {
+            "message": {"content": "OpenShift latest version\nOCP release notes 2025\n"}
+        }
+        queries = generate_search_queries("What is the latest OpenShift release?", "fast:7b")
+        assert len(queries) >= 1
+        assert any("OpenShift" in q for q in queries)
+
+    @patch("ollama_chain.common.chat_with_retry")
+    def test_strips_thinking_tags(self, mock_chat):
+        mock_chat.return_value = {
+            "message": {"content": "<think>thinking...</think>\nactual query\n"}
+        }
+        queries = generate_search_queries("test", "fast:7b")
+        assert len(queries) == 1
+        assert queries[0] == "actual query"
+
+    @patch("ollama_chain.common.chat_with_retry")
+    def test_filters_short_lines(self, mock_chat):
+        mock_chat.return_value = {
+            "message": {"content": "1.\n2.\ngood search query here\n"}
+        }
+        queries = generate_search_queries("test", "fast:7b")
+        assert all(len(q) > 5 for q in queries)
+
+    @patch("ollama_chain.common.chat_with_retry")
+    def test_caps_at_three(self, mock_chat):
+        mock_chat.return_value = {
+            "message": {"content": "query one\nquery two\nquery three\nquery four\nquery five\n"}
+        }
+        queries = generate_search_queries("test", "fast:7b")
+        assert len(queries) <= 3
+
+
+# ---------------------------------------------------------------------------
+# search_for_query (integration-level, mocked providers)
+# ---------------------------------------------------------------------------
+
+class TestSearchForQuery:
+    @patch("ollama_chain.search.docs_search", return_value=[])
+    @patch("ollama_chain.search.stackoverflow_search", return_value=[])
+    @patch("ollama_chain.search.github_search_issues", return_value=[])
+    @patch("ollama_chain.search.github_search", return_value=[])
+    @patch("ollama_chain.search.web_search", return_value=[
+        SearchResult("T1", "http://a.com", "S1", "web"),
+    ])
+    @patch("ollama_chain.search.generate_search_queries", return_value=["test query"])
+    def test_returns_formatted_results(self, _gq, _ws, _gh, _ghi, _so, _docs):
+        result = search_for_query("test", "fast:7b")
+        assert "T1" in result
+        assert "http://a.com" in result
+
+    @patch("ollama_chain.search.docs_search", return_value=[])
+    @patch("ollama_chain.search.stackoverflow_search", return_value=[])
+    @patch("ollama_chain.search.github_search_issues", return_value=[])
+    @patch("ollama_chain.search.github_search", return_value=[])
+    @patch("ollama_chain.search.web_search", return_value=[])
+    @patch("ollama_chain.search.generate_search_queries", return_value=["test"])
+    def test_returns_empty_when_no_results(self, _gq, _ws, _gh, _ghi, _so, _docs):
+        result = search_for_query("test", "fast:7b")
+        assert result == ""
+
+    @patch("ollama_chain.search.docs_search", return_value=[
+        SearchResult("Doc", "http://docs.example.com", "doc info", "docs"),
+    ])
+    @patch("ollama_chain.search.stackoverflow_search", return_value=[
+        SearchResult("SO", "http://so.com/q", "so info", "stackoverflow"),
+    ])
+    @patch("ollama_chain.search.github_search_issues", return_value=[])
+    @patch("ollama_chain.search.github_search", return_value=[
+        SearchResult("Repo", "http://gh.com/r", "gh info", "github"),
+    ])
+    @patch("ollama_chain.search.web_search", return_value=[
+        SearchResult("Web", "http://w.com", "web info", "web"),
+    ])
+    @patch("ollama_chain.search.generate_search_queries", return_value=["test"])
+    def test_deduplicates_urls(self, _gq, _ws, _gh, _ghi, _so, _docs):
+        result = search_for_query("test", "fast:7b")
+        assert result.count("http://w.com") == 1
+
+    @patch("ollama_chain.search.generate_search_queries", side_effect=Exception("fail"))
+    @patch("ollama_chain.search.docs_search", return_value=[])
+    @patch("ollama_chain.search.stackoverflow_search", return_value=[])
+    @patch("ollama_chain.search.github_search_issues", return_value=[])
+    @patch("ollama_chain.search.github_search", return_value=[])
+    @patch("ollama_chain.search.web_search", return_value=[
+        SearchResult("Fallback", "http://f.com", "fb", "web"),
+    ])
+    def test_fallback_to_original_query_on_generation_failure(self, _ws, _gh, _ghi, _so, _docs, _gq):
+        result = search_for_query("original query", "fast:7b")
+        assert "Fallback" in result

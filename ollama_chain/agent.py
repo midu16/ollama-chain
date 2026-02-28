@@ -103,12 +103,13 @@ def _agent_chat(
 # ---------------------------------------------------------------------------
 
 _DANGEROUS_PATTERNS = (
-    "rm -rf", "rm -r /", "mkfs", "dd if=", ":(){ ", "> /dev/sd",
+    "rm -rf /", "mkfs", "dd if=", ":(){ ", "> /dev/sd",
     "chmod -r 777 /", "format c:",
 )
 
 
 def _is_safe_command(cmd: str) -> bool:
+    """Block truly destructive commands while allowing security tools."""
     cmd_lower = cmd.strip().lower()
     return not any(p in cmd_lower for p in _DANGEROUS_PATTERNS)
 

@@ -1,26 +1,44 @@
 """Chaining modes — orchestrate all local models with web search and source citation."""
 
+import re
 import sys
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 
 from .common import SOURCE_GUIDANCE, ask, model_supports_thinking
 from .pcap import analyze_pcap, format_analysis as format_pcap_analysis
 from .k8s import analyze_cluster, format_analysis as format_k8s_analysis
 from .progress import progress_update
-from .router import build_fallback_chain, route_query
-from .search import search_for_query
+from .router import build_fallback_chain, is_time_sensitive, route_query
+from .search import search_for_query, web_search_news, format_search_results
 
-CLI_ONLY_MODES = frozenset({"pcap", "k8s"})
+CLI_ONLY_MODES = frozenset({"pcap", "k8s", "image"})
 
 # Temperature presets for accuracy-critical stages
 _TEMP_REVIEW = 0.4
 _TEMP_FINAL = 0.3
+_TEMP_GROUNDED = 0.2  # very low temp for search-grounded answers
 
 _SEARCH_ENRICH_TIMEOUT = 45  # hard ceiling for _enrich_with_search
 
+# Guidance that overrides model priors when fresh search results exist
+_GROUNDING_INSTRUCTION = (
+    "CRITICAL: Your answer MUST be grounded in the search results provided below. "
+    "Do NOT rely on your training data for version numbers, release dates, or "
+    "other time-sensitive facts. If the search results contain the answer, use "
+    "that information verbatim with a citation. If the search results contradict "
+    "your training data, ALWAYS prefer the search results. "
+    "If the search results do not contain enough information to answer, say so."
+)
 
-def _enrich_with_search(query: str, fast: str, web_search: bool) -> str:
+
+def _enrich_with_search(
+    query: str, fast: str, web_search: bool,
+    *, include_news: bool = False,
+) -> str:
     """If web search is enabled, fetch results and return a context block.
+
+    When *include_news* is True (for time-sensitive queries), also fetches
+    recent news articles in parallel for the freshest information.
 
     Wrapped in a hard timeout so the answer pipeline is never blocked
     indefinitely by search failures.
@@ -28,9 +46,21 @@ def _enrich_with_search(query: str, fast: str, web_search: bool) -> str:
     if not web_search:
         return ""
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(search_for_query, query, fast)
-            results = future.result(timeout=_SEARCH_ENRICH_TIMEOUT)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_main = pool.submit(search_for_query, query, fast)
+            future_news = None
+            if include_news:
+                future_news = pool.submit(web_search_news, query, 5)
+
+            results = future_main.result(timeout=_SEARCH_ENRICH_TIMEOUT)
+            news_results = ""
+            if future_news is not None:
+                try:
+                    news_raw = future_news.result(timeout=10)
+                    if news_raw:
+                        news_results = format_search_results(news_raw)
+                except Exception:
+                    pass
     except TimeoutError:
         print(
             f"[search] Search pipeline timed out after {_SEARCH_ENRICH_TIMEOUT}s, "
@@ -44,12 +74,65 @@ def _enrich_with_search(query: str, fast: str, web_search: bool) -> str:
             file=sys.stderr,
         )
         return ""
-    if not results:
+    if not results and not news_results:
         return ""
+
+    parts = []
+    parts.append(
+        "\n\n=== SEARCH RESULTS (Web, GitHub, Stack Overflow, Docs) ===\n"
+        "Use these as reference to improve accuracy. Cite sources when relevant.\n"
+    )
+    if results:
+        parts.append(results)
+    if news_results:
+        parts.append(
+            "\n=== RECENT NEWS ===\n"
+            "These are the most recent articles — prefer these for time-sensitive facts.\n"
+        )
+        parts.append(news_results)
+
+    return "\n".join(parts)
+
+
+def _extract_key_facts_from_search(search_context: str) -> str:
+    """Extract structured facts from search results for cross-verification.
+
+    Pulls out version numbers, dates, URLs, and other concrete data points
+    that models can use to ground their answers.
+    """
+    if not search_context:
+        return ""
+
+    facts: list[str] = []
+    version_patterns = [
+        r'(\d+\.\d+(?:\.\d+)?(?:\s*(?:LTS|GA|RC|Beta|Alpha|stable))?)',
+        r'[vV]ersion\s+(\S+)',
+        r'[rR]elease\s+(\d+\.\d+\S*)',
+    ]
+    for pat in version_patterns:
+        matches = re.findall(pat, search_context)
+        for m in matches:
+            m = m.strip().rstrip(".,;:!?")
+            if len(m) > 2 and m not in facts:
+                facts.append(m)
+
+    date_patterns = [
+        r'(\w+\s+\d{1,2},?\s+\d{4})',
+        r'(\d{4}-\d{2}-\d{2})',
+    ]
+    for pat in date_patterns:
+        matches = re.findall(pat, search_context)
+        for m in matches:
+            if m not in facts:
+                facts.append(m)
+
+    if not facts:
+        return ""
+
+    unique = list(dict.fromkeys(facts))[:15]
     return (
-        f"\n\n=== SEARCH RESULTS (Web, GitHub, Stack Overflow, Docs) ===\n"
-        f"Use these as reference to improve accuracy. Cite sources when relevant.\n\n"
-        f"{results}"
+        "Key data points extracted from search results: "
+        + ", ".join(unique)
     )
 
 
@@ -71,15 +154,21 @@ def chain_cascade(
 ) -> str:
     """
     Progressive refinement through every available model:
-      1. Web search gathers context
-      2. Smallest model produces initial draft
-      3. Each subsequent model reviews, corrects, and refines
-      4. Largest model produces the final authoritative answer
+      1. Web search gathers context (+ news for time-sensitive queries)
+      2. Key facts extracted from search results for grounding
+      3. Smallest model produces initial draft grounded in search evidence
+      4. Each subsequent model reviews, corrects, and cross-verifies
+      5. Largest model produces the final authoritative answer
 
     Thinking is engaged selectively based on *complexity*:
       - simple  → no thinking anywhere (speed priority)
       - moderate → thinking on final answer only
       - complex / None → thinking on review + final stages
+
+    Time-sensitive queries (latest version, current release, etc.) get:
+      - News search in addition to regular web search
+      - Stronger grounding instructions that override training data
+      - Lower temperature for factual precision
 
     Error handling: if an intermediate model fails (all retries exhausted),
     it is skipped and the cascade continues.  If the draft or final model
@@ -88,28 +177,46 @@ def chain_cascade(
     fast_name = fast or all_models[0]
     n = len(all_models)
     _pct_step = 85.0 / max(n, 1)
+    ts = is_time_sensitive(query)
 
     progress_update(2, "Searching web, GitHub, StackOverflow, Docs..." if web_search else "Preparing...")
-    search_ctx = _enrich_with_search(query, fast_name, web_search)
+    search_ctx = _enrich_with_search(
+        query, fast_name, web_search,
+        include_news=ts,
+    )
     skipped: list[str] = []
 
     review_think = complexity not in ("simple", "moderate")
     final_think = complexity != "simple"
 
-    # --- Stage 1: first model drafts (never thinks — speed matters) ---
-    draft_prompt = (
-        f"{SOURCE_GUIDANCE}\n\n"
-        f"Answer the following question thoroughly and accurately.\n\n"
-        f"Question: {query}"
+    extracted_facts = _extract_key_facts_from_search(search_ctx)
+    grounding = _GROUNDING_INSTRUCTION if (ts and search_ctx) else ""
+
+    # --- Stage 1: first model drafts (grounded in search evidence) ---
+    draft_parts = []
+    if grounding:
+        draft_parts.append(grounding)
+    draft_parts.append(SOURCE_GUIDANCE)
+    if extracted_facts:
+        draft_parts.append(f"\n{extracted_facts}")
+    draft_parts.append(
+        f"\n\nAnswer the following question thoroughly and accurately."
+        f"\n\nQuestion: {query}"
     )
+    draft_prompt = "\n".join(draft_parts)
     enriched_draft = _inject_search_context(draft_prompt, search_ctx)
+
+    draft_temp = _TEMP_GROUNDED if (ts and search_ctx) else None
 
     current_answer: str | None = None
     for draft_model in all_models:
         progress_update(10, f"Drafting with {draft_model}...")
         print(f"[cascade 1/{n}] Drafting with {draft_model}...", file=sys.stderr)
         try:
-            current_answer = ask(enriched_draft, model=draft_model)
+            current_answer = ask(
+                enriched_draft, model=draft_model,
+                temperature=draft_temp,
+            )
             break
         except Exception as e:
             print(
@@ -131,7 +238,7 @@ def chain_cascade(
             )
         return current_answer
 
-    # --- Stages 2..N-1: intermediate models review and refine ---
+    # --- Stages 2..N-1: intermediate models review and cross-verify ---
     review_models = [
         m for m in all_models[1:-1] if m not in skipped
     ]
@@ -144,23 +251,38 @@ def chain_cascade(
             file=sys.stderr,
         )
         try:
-            current_answer = ask(
-                f"You are a reviewer improving the accuracy of an answer.\n"
-                f"{SOURCE_GUIDANCE}\n\n"
-                f"Original question: {query}\n\n"
+            review_parts = [
+                "You are a reviewer improving the accuracy of an answer.",
+            ]
+            if grounding:
+                review_parts.append(grounding)
+            review_parts.append(SOURCE_GUIDANCE)
+            if extracted_facts:
+                review_parts.append(f"\n{extracted_facts}")
+            review_parts.append(
+                f"\n\nOriginal question: {query}\n\n"
                 f"Current answer:\n{current_answer}\n\n"
                 f"Instructions:\n"
-                f"- Fix any factual errors\n"
-                f"- Add missing important information\n"
+                f"- Cross-verify every factual claim against the search results below\n"
+                f"- Fix any factual errors, especially version numbers, dates, and names\n"
+                f"- If search results contradict the answer, correct it using the search data\n"
+                f"- Add missing important information from the search results\n"
                 f"- Strengthen source references (add [Source: ...] citations)\n"
                 f"- Remove unsupported speculation\n"
-                f"- Improve clarity and structure\n"
-                f"- Preserve what is already correct\n"
+                f"- Preserve what is already correct and verified\n"
                 f"Output ONLY the improved answer, not a commentary on the changes."
-                + (f"\n{search_ctx}" if search_ctx else ""),
+            )
+            review_prompt = "\n".join(review_parts)
+            if search_ctx:
+                review_prompt += f"\n{search_ctx}"
+
+            current_answer = ask(
+                review_prompt,
                 model=model,
                 thinking=review_think,
-                temperature=_TEMP_REVIEW if review_think else None,
+                temperature=_TEMP_GROUNDED if (ts and search_ctx) else (
+                    _TEMP_REVIEW if review_think else None
+                ),
             )
         except Exception as e:
             print(
@@ -170,23 +292,33 @@ def chain_cascade(
             skipped.append(model)
 
     # --- Final stage: strongest model produces authoritative answer ---
-    final_prompt = (
-        f"You are the final reviewer producing the definitive answer.\n"
-        f"{SOURCE_GUIDANCE}\n\n"
-        f"Original question: {query}\n\n"
+    final_parts = [
+        "You are the final reviewer producing the definitive answer.",
+    ]
+    if grounding:
+        final_parts.append(grounding)
+    final_parts.append(SOURCE_GUIDANCE)
+    if extracted_facts:
+        final_parts.append(f"\n{extracted_facts}")
+    final_parts.append(
+        f"\n\nOriginal question: {query}\n\n"
         f"Draft answer (refined by {n - 1 - len(skipped)} model(s)):\n"
         f"{current_answer}\n\n"
         f"Instructions:\n"
-        f"- Verify all factual claims and correct any remaining errors\n"
+        f"- Cross-verify all factual claims against the search results below\n"
+        f"- Correct any claims that contradict the search results\n"
         f"- Ensure every key claim has a [Source: ...] reference to an authoritative source "
         f"(official docs, standards bodies like IEEE/IETF/ISO/NIST/W3C, "
         f"vendor docs like Red Hat/kernel.org/MDN, or peer-reviewed work)\n"
-        f"- If a claim cannot be verified, mark it as unverified\n"
+        f"- If a claim cannot be verified by search results or known standards, "
+        f"mark it as unverified\n"
         f"- Produce a clean, well-structured final answer\n"
         f"- Do NOT include meta-commentary about the review process\n"
         f"Output ONLY the final authoritative answer."
-        + (f"\n{search_ctx}" if search_ctx else "")
     )
+    final_prompt = "\n".join(final_parts)
+    if search_ctx:
+        final_prompt += f"\n{search_ctx}"
 
     final_models = [all_models[-1]] + build_fallback_chain(
         all_models, all_models[-1],
@@ -204,7 +336,9 @@ def chain_cascade(
             result = ask(
                 final_prompt, model=final_model,
                 thinking=final_think,
-                temperature=_TEMP_FINAL if final_think else None,
+                temperature=_TEMP_GROUNDED if (ts and search_ctx) else (
+                    _TEMP_FINAL if final_think else None
+                ),
             )
             if skipped:
                 print(
@@ -240,7 +374,11 @@ def chain_route(
     """Fast model classifies complexity, routes to fast or strong."""
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
-    search_ctx = _enrich_with_search(query, fast_name, web_search)
+    ts = is_time_sensitive(query)
+    search_ctx = _enrich_with_search(
+        query, fast_name, web_search,
+        include_news=ts,
+    )
 
     progress_update(5, "Searching..." if web_search else "Preparing...")
     progress_update(20, f"Classifying complexity with {fast_name}...")
@@ -279,7 +417,11 @@ def chain_pipeline(
     """Fast model extracts/classifies, strong model reasons with search context."""
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
-    search_ctx = _enrich_with_search(query, fast_name, web_search)
+    ts = is_time_sensitive(query)
+    search_ctx = _enrich_with_search(
+        query, fast_name, web_search,
+        include_news=ts,
+    )
 
     progress_update(5, "Searching..." if web_search else "Preparing...")
     progress_update(15, f"Extracting key points with {fast_name}...")
@@ -315,29 +457,46 @@ def chain_verify(
     query: str, all_models: list[str], *,
     web_search: bool = True, fast: str | None = None,
 ) -> str:
-    """Fast model drafts, strong model verifies with search context for fact-checking."""
+    """Fast model drafts, strong model cross-verifies against search evidence."""
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
-    search_ctx = _enrich_with_search(query, fast_name, web_search)
+    ts = is_time_sensitive(query)
+    search_ctx = _enrich_with_search(
+        query, fast_name, web_search,
+        include_news=ts,
+    )
 
     progress_update(5, "Searching..." if web_search else "Preparing...")
     progress_update(20, f"Drafting with {fast_name}...")
     print(f"[verify 1/2] Drafting with {fast_name}...", file=sys.stderr)
     draft = ask(f"{SOURCE_GUIDANCE}\n\n{query}", model=fast_name)
 
+    grounding = _GROUNDING_INSTRUCTION if (ts and search_ctx) else ""
+    extracted = _extract_key_facts_from_search(search_ctx)
+
     progress_update(50, f"Verifying with {strong_name} +think...")
     print(f"[verify 2/2] Verifying with {strong_name} +think...", file=sys.stderr)
-    prompt = (
-        f"Another model answered the following question. "
-        f"Verify the answer for correctness, fix any errors, and improve it. "
-        f"Ensure all claims are backed by authoritative sources.\n"
-        f"{SOURCE_GUIDANCE}\n\n"
-        f"Question: {query}\n\n"
-        f"Draft answer:\n{draft}"
+
+    verify_parts = []
+    if grounding:
+        verify_parts.append(grounding)
+    verify_parts.append(
+        "Another model answered the following question. "
+        "Cross-verify every factual claim against the search results below. "
+        "Fix any errors — especially version numbers, dates, and proper nouns. "
+        "If the search results contradict the draft, prefer the search results. "
+        "Ensure all claims are backed by authoritative sources."
     )
+    verify_parts.append(SOURCE_GUIDANCE)
+    if extracted:
+        verify_parts.append(extracted)
+    verify_parts.append(f"\nQuestion: {query}\n\nDraft answer:\n{draft}")
+
+    prompt = "\n".join(verify_parts)
     return ask(
         _inject_search_context(prompt, search_ctx), model=strong_name,
-        thinking=True, temperature=_TEMP_REVIEW,
+        thinking=True,
+        temperature=_TEMP_GROUNDED if (ts and search_ctx) else _TEMP_REVIEW,
     )
 
 
@@ -348,7 +507,11 @@ def chain_consensus(
     """All models answer independently, strongest merges the best parts."""
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
-    search_ctx = _enrich_with_search(query, fast_name, web_search)
+    ts = is_time_sensitive(query)
+    search_ctx = _enrich_with_search(
+        query, fast_name, web_search,
+        include_news=ts,
+    )
 
     progress_update(5, "Searching..." if web_search else "Preparing...")
     sourced_query = f"{SOURCE_GUIDANCE}\n\n{query}"
@@ -394,13 +557,32 @@ def chain_search(
     query: str, all_models: list[str], *,
     web_search: bool = True, fast: str | None = None,
 ) -> str:
-    """Search-first mode: always searches, strongest model synthesizes."""
+    """Search-first mode: always searches, strongest model synthesizes.
+
+    For time-sensitive queries, also fetches news results and uses
+    stronger grounding instructions.
+    """
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
+    ts = is_time_sensitive(query)
+
     progress_update(5, "Searching web, GitHub, StackOverflow, Docs...")
     results = search_for_query(query, fast_name)
 
-    if not results:
+    news_block = ""
+    if ts:
+        try:
+            news_raw = web_search_news(query, 5)
+            if news_raw:
+                news_block = (
+                    "\n\n=== RECENT NEWS ===\n"
+                    "Prefer these for time-sensitive facts.\n"
+                    + format_search_results(news_raw)
+                )
+        except Exception:
+            pass
+
+    if not results and not news_block:
         progress_update(40, f"No results, answering with {strong_name} +think...")
         print("[search] No results found, falling back to strong model +think...", file=sys.stderr)
         return ask(
@@ -408,20 +590,36 @@ def chain_search(
             thinking=True, temperature=_TEMP_FINAL,
         )
 
+    grounding = _GROUNDING_INSTRUCTION if ts else ""
+    extracted = _extract_key_facts_from_search(results + news_block)
+
     progress_update(40, f"Synthesizing answer with {strong_name} +think...")
     print(f"[search] Synthesizing answer with {strong_name} +think...", file=sys.stderr)
+
+    prompt_parts = []
+    if grounding:
+        prompt_parts.append(grounding)
+    prompt_parts.append(
+        "Answer the following question using the web search results below. "
+        "Be accurate, cite sources by number and include their URLs. "
+        "Prioritize authoritative sources (official documentation, standards bodies "
+        "like IEEE/IETF/ISO/NIST/W3C, vendor docs like Red Hat/kernel.org/MDN). "
+        "Clearly state if the search results don't fully answer the question."
+    )
+    prompt_parts.append(SOURCE_GUIDANCE)
+    if extracted:
+        prompt_parts.append(extracted)
+    prompt_parts.append(f"\nQuestion: {query}")
+    if results:
+        prompt_parts.append(f"\n=== SEARCH RESULTS ===\n{results}")
+    if news_block:
+        prompt_parts.append(news_block)
+
     return ask(
-        f"Answer the following question using the web search results below. "
-        f"Be accurate, cite sources by number and include their URLs. "
-        f"Prioritize authoritative sources (official documentation, standards bodies "
-        f"like IEEE/IETF/ISO/NIST/W3C, vendor docs like Red Hat/kernel.org/MDN). "
-        f"Clearly state if the search results don't fully answer the question.\n"
-        f"{SOURCE_GUIDANCE}\n\n"
-        f"Question: {query}\n\n"
-        f"=== SEARCH RESULTS ===\n{results}",
+        "\n".join(prompt_parts),
         model=strong_name,
         thinking=True,
-        temperature=_TEMP_FINAL,
+        temperature=_TEMP_GROUNDED if ts else _TEMP_FINAL,
     )
 
 
@@ -431,7 +629,11 @@ def chain_fast(
 ) -> str:
     """Direct to fast model, optionally with search context."""
     fast_name = fast or all_models[0]
-    search_ctx = _enrich_with_search(query, fast_name, web_search)
+    ts = is_time_sensitive(query)
+    search_ctx = _enrich_with_search(
+        query, fast_name, web_search,
+        include_news=ts,
+    )
     progress_update(20, f"Answering with {fast_name}...")
     print(f"[fast 1/1] {fast_name}...", file=sys.stderr)
     return ask(
@@ -447,7 +649,11 @@ def chain_strong(
     """Direct to strong model, optionally with search context."""
     fast_name = fast or all_models[0]
     strong_name = all_models[-1]
-    search_ctx = _enrich_with_search(query, fast_name, web_search)
+    ts = is_time_sensitive(query)
+    search_ctx = _enrich_with_search(
+        query, fast_name, web_search,
+        include_news=ts,
+    )
     progress_update(5, "Searching..." if web_search else "Preparing...")
     progress_update(20, f"Answering with {strong_name} +think...")
     print(f"[strong 1/1] {strong_name} +think...", file=sys.stderr)
@@ -703,6 +909,37 @@ def chain_agent(
 
 
 # ---------------------------------------------------------------------------
+# HACK — autonomous penetration testing mode
+# ---------------------------------------------------------------------------
+
+def chain_hack(
+    query: str, all_models: list[str], *,
+    web_search: bool = True, fast: str | None = None,
+    max_iterations: int = 0,
+    target: str = "",
+) -> str:
+    """
+    Autonomous penetration testing agent:
+      1. Multi-phase attack: recon → scan → enumerate → vuln research → exploit → post-exploit
+      2. Adapts techniques based on findings from each phase
+      3. Researches new attack vectors when standard approaches fail
+      4. Runs indefinitely until the target is compromised or user aborts
+      5. Generates professional pentest report
+
+    WARNING: Only use against systems you have explicit authorization to test.
+    """
+    from .hackmode import run_hack
+
+    hack_target = target or query
+    return run_hack(
+        hack_target, all_models,
+        web_search=web_search,
+        fast=fast,
+        max_iterations=max_iterations,
+    )
+
+
+# ---------------------------------------------------------------------------
 # AUTO — router-driven mode selection
 # ---------------------------------------------------------------------------
 
@@ -716,6 +953,9 @@ def chain_auto(
       simple   → direct to fast model (skip search)
       moderate → subset cascade (fast + strong)
       complex  → full cascade through all models
+
+    Time-sensitive queries are upgraded to at least moderate and always
+    use web search + news.
     """
     fast_name = fast or all_models[0]
     decision = route_query(
@@ -726,11 +966,13 @@ def chain_auto(
     print(
         f"[auto] Routed: complexity={decision.complexity} "
         f"strategy={decision.strategy} models={len(decision.models)} "
+        f"time_sensitive={decision.time_sensitive} "
         f"({decision.reasoning})",
         file=sys.stderr,
     )
 
-    use_search = web_search and not decision.skip_search
+    # Time-sensitive queries should never skip search
+    use_search = web_search and (not decision.skip_search or decision.time_sensitive)
 
     if decision.strategy == "direct_fast":
         return chain_fast(
@@ -762,4 +1004,5 @@ CHAINS = {
     "fast": chain_fast,
     "strong": chain_strong,
     "agent": chain_agent,
+    "hack": chain_hack,
 }

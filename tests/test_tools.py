@@ -143,3 +143,145 @@ class TestFormatDescriptions:
     def test_has_parameters(self):
         desc = format_tool_descriptions()
         assert "Parameters:" in desc
+
+
+# ---------------------------------------------------------------------------
+# python_eval sandbox
+# ---------------------------------------------------------------------------
+
+class TestPythonEvalSandbox:
+    def test_math_works(self):
+        r = execute_tool("python_eval", {"code": "math.sqrt(144)"})
+        assert r.success
+        assert "12" in r.output
+
+    def test_list_comprehension(self):
+        r = execute_tool("python_eval", {"code": "[x**2 for x in range(5)]"})
+        assert r.success
+        assert "[0, 1, 4, 9, 16]" in r.output
+
+    def test_blocks_import(self):
+        r = execute_tool("python_eval", {"code": "__import__('os')"})
+        assert not r.success
+        assert "Blocked" in r.output
+
+    def test_blocks_os_module(self):
+        r = execute_tool("python_eval", {"code": "os.system('ls')"})
+        assert not r.success
+
+    def test_blocks_exec(self):
+        r = execute_tool("python_eval", {"code": "exec('print(1)')"})
+        assert not r.success
+
+    def test_blocks_open(self):
+        r = execute_tool("python_eval", {"code": "open('/etc/passwd')"})
+        assert not r.success
+
+    def test_blocks_subprocess(self):
+        r = execute_tool("python_eval", {"code": "subprocess.run(['ls'])"})
+        assert not r.success
+
+    def test_string_operations(self):
+        r = execute_tool("python_eval", {"code": "'hello'.upper()"})
+        assert r.success
+        assert r.output == "HELLO"
+
+    def test_builtins_available(self):
+        r = execute_tool("python_eval", {"code": "len([1,2,3])"})
+        assert r.success
+        assert r.output == "3"
+
+
+# ---------------------------------------------------------------------------
+# Shell tool edge cases
+# ---------------------------------------------------------------------------
+
+class TestShellEdgeCases:
+    def test_destructive_rm_rf_blocked(self):
+        from ollama_chain.tools import tool_shell
+        r = tool_shell("rm -rf /")
+        assert not r.success
+        assert "Blocked" in r.output
+
+    def test_destructive_mkfs_blocked(self):
+        from ollama_chain.tools import tool_shell
+        r = tool_shell("mkfs.ext4 /dev/sda1")
+        assert not r.success
+
+    def test_destructive_dd_blocked(self):
+        from ollama_chain.tools import tool_shell
+        r = tool_shell("dd if=/dev/zero of=/dev/sda")
+        assert not r.success
+
+    def test_timeout_parameter(self):
+        from ollama_chain.tools import tool_shell
+        r = tool_shell("sleep 10", timeout=1)
+        assert not r.success
+        assert "timed out" in r.output.lower()
+
+    def test_stderr_captured(self):
+        from ollama_chain.tools import tool_shell
+        r = tool_shell("echo err >&2")
+        assert "err" in r.output
+
+    def test_exit_code_reported(self):
+        from ollama_chain.tools import tool_shell
+        r = tool_shell("exit 42")
+        assert not r.success
+        assert "42" in r.output
+
+    def test_empty_output(self):
+        from ollama_chain.tools import tool_shell
+        r = tool_shell("true")
+        assert r.success
+
+
+# ---------------------------------------------------------------------------
+# File tools edge cases
+# ---------------------------------------------------------------------------
+
+class TestFileToolEdgeCases:
+    def test_write_creates_directories(self, tmp_path):
+        from ollama_chain.tools import tool_write_file
+        p = str(tmp_path / "sub" / "dir" / "file.txt")
+        r = tool_write_file(p, "data")
+        assert r.success
+        assert os.path.exists(p)
+
+    def test_read_empty_file(self, tmp_path):
+        from ollama_chain.tools import tool_read_file
+        f = tmp_path / "empty.txt"
+        f.write_text("")
+        r = tool_read_file(str(f))
+        assert r.success
+        assert "empty" in r.output.lower()
+
+    def test_list_dir_nonexistent(self):
+        from ollama_chain.tools import tool_list_dir
+        r = tool_list_dir("/nonexistent_directory_xyz")
+        assert not r.success
+
+    def test_list_dir_default_path(self):
+        from ollama_chain.tools import tool_list_dir
+        r = tool_list_dir()
+        assert r.success
+
+
+# ---------------------------------------------------------------------------
+# Retry with fallback integration
+# ---------------------------------------------------------------------------
+
+class TestRetryWithFallback:
+    def test_unknown_tool_returns_error(self):
+        r = execute_tool_with_retry("totally_fake_tool", {"arg": "val"})
+        assert not r.success
+        assert "Unknown tool" in r.output
+
+    def test_bad_args_no_retry(self):
+        r = execute_tool_with_retry("shell", {"nonexistent_param": "val"})
+        assert not r.success
+
+    def test_successful_tool_has_timing(self):
+        r = execute_tool_with_retry("python_eval", {"code": "42"})
+        assert r.success
+        assert r.duration_ms >= 0

@@ -56,9 +56,27 @@ class Tool:
 
 _MAX_SHELL_OUTPUT = 100_000  # 100 KB cap on shell command output
 
+_DESTRUCTIVE_PATTERNS = (
+    "rm -rf /", "mkfs", "dd if=", ":(){ ", "> /dev/sd",
+    "chmod -r 777 /", "format c:",
+)
+
+
+def _is_destructive(cmd: str) -> bool:
+    """Check for truly destructive commands (data loss / system damage)."""
+    cmd_lower = cmd.strip().lower()
+    return any(p in cmd_lower for p in _DESTRUCTIVE_PATTERNS)
+
 
 def tool_shell(command: str, timeout: int = 30) -> ToolResult:
     """Execute a shell command and return combined stdout/stderr."""
+    if _is_destructive(command):
+        return ToolResult(
+            False,
+            f"Blocked: command matches a destructive pattern and could cause data loss",
+            "shell",
+            error_detail="destructive_command",
+        )
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
@@ -198,6 +216,117 @@ def tool_stackoverflow_search(query: str) -> ToolResult:
 def tool_docs_search(query: str) -> ToolResult:
     """Search trusted documentation sites."""
     return _run_search_with_timeout(docs_search, "docs_search", query, max_results=5)
+
+
+# ---------------------------------------------------------------------------
+# Security / penetration testing tools
+# ---------------------------------------------------------------------------
+
+_NMAP_TIMEOUT = 300  # 5 minutes for comprehensive scans
+
+
+def tool_port_scan(target: str, ports: str = "", scan_type: str = "default") -> ToolResult:
+    """Scan target ports using nmap with configurable scan types."""
+    scan_flags = {
+        "default": "-sS -sV -O -T4 --top-ports 1000",
+        "full": "-sS -sV -O -A -p-",
+        "quick": "-sS -T4 --top-ports 100",
+        "udp": "-sU --top-ports 50",
+        "stealth": "-sS -T2 -f --data-length 24",
+        "vuln": "--script=vuln",
+        "aggressive": "-sS -sV -O -A -T4 --script=default,vuln",
+    }
+    flags = scan_flags.get(scan_type, scan_flags["default"])
+    if ports:
+        flags += f" -p {ports}"
+
+    cmd = f"nmap {flags} {target}"
+    return tool_shell(cmd, timeout=_NMAP_TIMEOUT)
+
+
+def tool_service_probe(target: str, port: str) -> ToolResult:
+    """Deep probe a specific service on a target port."""
+    commands = [
+        f"nmap -sV --version-intensity 9 -p {port} --script=banner {target}",
+        f"nmap --script=default -p {port} {target}",
+    ]
+    cmd = " && ".join(commands)
+    return tool_shell(cmd, timeout=120)
+
+
+def tool_vuln_scan(target: str, ports: str = "") -> ToolResult:
+    """Run vulnerability scanning scripts against the target."""
+    port_flag = f"-p {ports}" if ports else "--top-ports 100"
+    commands = [
+        f"nmap --script=vuln,vulners -sV {port_flag} {target}",
+    ]
+    cmd = " ; ".join(commands)
+    return tool_shell(cmd, timeout=_NMAP_TIMEOUT)
+
+
+def tool_brute_force(
+    target: str, service: str, port: str = "",
+    userlist: str = "", passlist: str = "",
+) -> ToolResult:
+    """Attempt credential brute forcing against a service."""
+    default_users = "/usr/share/seclists/Usernames/top-usernames-shortlist.txt"
+    default_pass = "/usr/share/wordlists/rockyou.txt"
+
+    ulist = userlist or default_users
+    plist = passlist or default_pass
+
+    port_flag = f"-s {port}" if port else ""
+    cmd = (
+        f"hydra -L {ulist} -P {plist} {port_flag} {target} {service} "
+        f"-t 4 -f -o /tmp/hydra_{service}_{target}.txt "
+        f"2>/dev/null || echo 'hydra not available — install with: apt install hydra'"
+    )
+    return tool_shell(cmd, timeout=600)
+
+
+def tool_exploit_search(query: str) -> ToolResult:
+    """Search for known exploits using searchsploit and web search."""
+    cmd = (
+        f"searchsploit '{query}' 2>/dev/null || "
+        f"echo 'searchsploit not available — install exploitdb package'"
+    )
+    local_result = tool_shell(cmd, timeout=30)
+
+    web_result = _run_search_with_timeout(
+        web_search, "exploit_search",
+        f"{query} exploit PoC CVE", max_results=5,
+    )
+
+    combined_output = ""
+    if local_result.success and "not available" not in local_result.output:
+        combined_output += f"=== Local Exploit DB ===\n{local_result.output}\n\n"
+    if web_result.success:
+        combined_output += f"=== Web Search ===\n{web_result.output}"
+
+    if not combined_output:
+        combined_output = local_result.output + "\n" + web_result.output
+
+    return ToolResult(
+        success=bool(combined_output.strip()),
+        output=combined_output.strip() or "No exploits found",
+        tool_name="exploit_search",
+    )
+
+
+def tool_dir_brute(target: str, port: str = "80", wordlist: str = "") -> ToolResult:
+    """Brute force directories and files on a web server."""
+    default_wordlist = "/usr/share/wordlists/dirb/common.txt"
+    wl = wordlist or default_wordlist
+    protocol = "https" if port in ("443", "8443") else "http"
+
+    cmd = (
+        f"gobuster dir -u {protocol}://{target}:{port}/ -w {wl} -t 20 -q "
+        f"2>/dev/null || "
+        f"dirb {protocol}://{target}:{port}/ {wl} -S -r "
+        f"2>/dev/null || "
+        f"echo 'No directory brute-force tools available — install gobuster or dirb'"
+    )
+    return tool_shell(cmd, timeout=300)
 
 
 _EVAL_BLOCKED_KEYWORDS = frozenset({
@@ -345,6 +474,92 @@ TOOL_REGISTRY: dict[str, Tool] = {
         max_retries=2,
         retry_delay=2.0,
     ),
+    "port_scan": Tool(
+        name="port_scan",
+        description=(
+            "Scan target ports using nmap. Supports scan types: default, full, "
+            "quick, udp, stealth, vuln, aggressive. (hack mode)"
+        ),
+        parameters={
+            "target": "Target IP or hostname",
+            "ports": "(optional) Port range, e.g. '1-1000' or '22,80,443'",
+            "scan_type": "(optional) Scan type: default|full|quick|udp|stealth|vuln|aggressive",
+        },
+        function=tool_port_scan,
+        max_retries=2,
+        retry_delay=3.0,
+    ),
+    "service_probe": Tool(
+        name="service_probe",
+        description=(
+            "Deep probe a specific service on a target port with intensive "
+            "version detection and default scripts. (hack mode)"
+        ),
+        parameters={
+            "target": "Target IP or hostname",
+            "port": "Port number to probe",
+        },
+        function=tool_service_probe,
+        max_retries=1,
+        retry_delay=2.0,
+    ),
+    "vuln_scan": Tool(
+        name="vuln_scan",
+        description=(
+            "Run nmap vulnerability scanning scripts (vuln, vulners) against "
+            "a target. (hack mode)"
+        ),
+        parameters={
+            "target": "Target IP or hostname",
+            "ports": "(optional) Specific ports to scan",
+        },
+        function=tool_vuln_scan,
+        max_retries=1,
+        retry_delay=3.0,
+    ),
+    "brute_force": Tool(
+        name="brute_force",
+        description=(
+            "Attempt credential brute forcing against a service using hydra. "
+            "Supports SSH, FTP, HTTP, SMB, etc. (hack mode)"
+        ),
+        parameters={
+            "target": "Target IP or hostname",
+            "service": "Service protocol (ssh, ftp, http-get, smb, etc.)",
+            "port": "(optional) Service port",
+            "userlist": "(optional) Path to username wordlist",
+            "passlist": "(optional) Path to password wordlist",
+        },
+        function=tool_brute_force,
+        max_retries=1,
+        retry_delay=5.0,
+    ),
+    "exploit_search": Tool(
+        name="exploit_search",
+        description=(
+            "Search for known exploits using searchsploit (local exploit-db) "
+            "and web search. (hack mode)"
+        ),
+        parameters={"query": "Search query (e.g. 'Apache 2.4.49 RCE')"},
+        function=tool_exploit_search,
+        max_retries=2,
+        retry_delay=2.0,
+    ),
+    "dir_brute": Tool(
+        name="dir_brute",
+        description=(
+            "Brute force directories and files on a web server using gobuster "
+            "or dirb. (hack mode)"
+        ),
+        parameters={
+            "target": "Target IP or hostname",
+            "port": "(optional) Web server port, default 80",
+            "wordlist": "(optional) Path to wordlist",
+        },
+        function=tool_dir_brute,
+        max_retries=1,
+        retry_delay=3.0,
+    ),
 }
 
 TOOL_FALLBACKS: dict[str, list[str]] = {
@@ -354,6 +569,12 @@ TOOL_FALLBACKS: dict[str, list[str]] = {
     "stackoverflow_search": ["web_search"],
     "docs_search": ["web_search"],
     "read_file": ["shell"],
+    "port_scan": ["shell"],
+    "service_probe": ["shell"],
+    "vuln_scan": ["port_scan", "shell"],
+    "brute_force": ["shell"],
+    "exploit_search": ["web_search"],
+    "dir_brute": ["shell"],
 }
 
 

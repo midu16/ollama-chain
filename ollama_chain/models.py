@@ -42,8 +42,33 @@ def _get(obj, key, default=None):
     return getattr(obj, key, default)
 
 
+_IMAGE_ONLY_CAPABILITY = "image"
+_TEXT_CAPABILITIES = frozenset({"completion", "tools", "thinking"})
+
+
+def _is_image_only_model(name: str) -> bool:
+    """Check whether a model is image-generation-only (no text capabilities).
+
+    Queries ``ollama.show()`` for capabilities. Models that only have
+    the ``image`` capability (and none of completion/tools/thinking)
+    are excluded from the text model cascade.
+    """
+    try:
+        info = ollama.show(name)
+        caps = set(_get(info, "capabilities", None) or [])
+        if _IMAGE_ONLY_CAPABILITY in caps and not caps & _TEXT_CAPABILITIES:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def discover_models(*, _force: bool = False) -> list[ModelInfo]:
-    """Query Ollama API and return sorted list of available models (smallest first).
+    """Query Ollama API and return sorted list of available text models (smallest first).
+
+    Image-only models (those with only the ``image`` capability) are
+    excluded from the text cascade.  Use ``image.discover_image_models()``
+    to find image generation models.
 
     Results are cached for ``_MODEL_CACHE_TTL`` seconds to avoid
     redundant API calls when multiple callers query models in quick
@@ -67,6 +92,8 @@ def discover_models(*, _force: bool = False) -> list[ModelInfo]:
     for m in raw_models:
         details = _get(m, "details", {}) or {}
         name = _get(m, "model", None) or _get(m, "name", "unknown")
+        if _is_image_only_model(name):
+            continue
         models.append(ModelInfo(
             name=name,
             parameter_size=_parse_param_size(

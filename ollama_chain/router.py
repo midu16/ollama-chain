@@ -37,6 +37,7 @@ class RouteDecision:
     skip_search: bool
     confidence: float
     reasoning: str = ""
+    time_sensitive: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,42 @@ _SIMPLE_PREFIXES = (
     "what is", "what are", "who is", "when did", "where is",
     "define ", "what port", "what does", "how many",
 )
+
+_TIME_SENSITIVE_KEYWORDS = frozenset({
+    "latest", "current", "newest", "most recent", "today",
+    "this week", "this month", "this year", "right now",
+    "up to date", "up-to-date", "as of", "2024", "2025", "2026",
+    "release", "version", "update", "patch", "announcement",
+    "just released", "recently", "new release",
+})
+
+_TIME_SENSITIVE_PATTERNS = (
+    "what is the latest", "what is the current", "what is the newest",
+    "what is the most recent", "what version", "which version",
+    "what release", "most current", "latest version",
+    "current version", "newest version", "latest release",
+    "current release", "newest release",
+)
+
+
+def is_time_sensitive(query: str) -> bool:
+    """Detect whether a query requires current/up-to-date information.
+
+    Time-sensitive queries need fresh web/news search results and models
+    must be strongly instructed to defer to search evidence over training
+    data.
+    """
+    q = query.lower().strip()
+    if any(q.startswith(p) or p in q for p in _TIME_SENSITIVE_PATTERNS):
+        return True
+    words = q.split()
+    for kw in _TIME_SENSITIVE_KEYWORDS:
+        if " " in kw:
+            if kw in q:
+                return True
+        elif kw in words:
+            return True
+    return False
 
 
 def classify_complexity_heuristic(query: str) -> tuple[str, float]:
@@ -141,11 +178,17 @@ def route_query(
     fast = fast_model or all_models[0]
     strong = all_models[-1]
     n = len(all_models)
+    ts = is_time_sensitive(query)
 
     if use_llm and n > 1:
         complexity, confidence = classify_complexity_llm(query, fast)
     else:
         complexity, confidence = classify_complexity_heuristic(query)
+
+    # Time-sensitive queries are at least moderate complexity (need search)
+    if ts and complexity == COMPLEXITY_SIMPLE:
+        complexity = COMPLEXITY_MODERATE
+        confidence = max(confidence - 0.1, 0.5)
 
     if n == 1:
         return RouteDecision(
@@ -156,6 +199,7 @@ def route_query(
             skip_search=not web_search,
             confidence=confidence,
             reasoning="Single model available",
+            time_sensitive=ts,
         )
 
     if complexity == COMPLEXITY_SIMPLE:
@@ -167,6 +211,7 @@ def route_query(
             skip_search=True,
             confidence=confidence,
             reasoning="Simple query — fast model sufficient",
+            time_sensitive=ts,
         )
 
     if complexity == COMPLEXITY_MODERATE:
@@ -179,6 +224,7 @@ def route_query(
             skip_search=not web_search,
             confidence=confidence,
             reasoning="Moderate query — subset cascade (fast + strong)",
+            time_sensitive=ts,
         )
 
     return RouteDecision(
@@ -189,6 +235,7 @@ def route_query(
         skip_search=not web_search,
         confidence=confidence,
         reasoning="Complex query — full cascade through all models",
+        time_sensitive=ts,
     )
 
 

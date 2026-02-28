@@ -8,6 +8,7 @@ import time as _time
 
 from .models import discover_models, ensure_memory_available, model_names, pick_models, list_models_table
 from .chains import CHAINS, chain_pcap, chain_k8s
+from .image import chain_image, discover_image_models, image_model_names
 from .common import SOURCE_GUIDANCE, ask, ensure_sources, unload_all_models
 from .memory import PersistentMemory
 from .metrics import evaluate_prompt, evaluate_mode_alignment, evaluate_response
@@ -42,6 +43,8 @@ modes:
   verify      Fast model drafts, strong model verifies and refines
   search      Search-first: always fetches web results, strong model synthesizes
   agent       Autonomous agent with planning, memory, tools, and dynamic control flow
+  hack        Autonomous penetration testing agent (use --target)
+  image       Generate images from text descriptions using diffusion models     [CLI only]
   pcap        Analyze a .pcap file (auto-detected from query, or use --pcap)  [CLI only]
   k8s         Analyze a Kubernetes/OpenShift cluster (use --kubeconfig)       [CLI only]
   fast        Direct to smallest/fastest model
@@ -52,6 +55,16 @@ agent mode:
   web search, python eval) to gather information, persists facts to
   long-term memory (~/.ollama_chain/), and re-plans dynamically on
   failures.  Use --max-iterations to control the execution budget.
+
+hack mode:
+  Autonomous penetration testing agent that performs multi-phase attacks:
+  reconnaissance → scanning → enumeration → vulnerability research →
+  exploitation → post-exploitation.  Adapts techniques based on findings,
+  researches new attack vectors when standard approaches fail, and runs
+  indefinitely until the target is compromised or the user aborts (Ctrl+C).
+  Use --target to specify the target IP/hostname.
+  Use --max-iterations to limit the attack loop (0 = unlimited, default).
+  WARNING: Only use against systems you have explicit authorization to test.
 
 web search (multi-source):
   All modes search multiple sources in parallel for context:
@@ -64,6 +77,16 @@ source citations:
   IEEE, ISO, NIST, W3C, Red Hat, kernel.org, MDN, official docs).
   Every answer includes a mandatory ## Sources section.  If the model
   omits it, a follow-up call appends one automatically.
+
+image mode:
+  Generate images from text descriptions using locally installed
+  diffusion models (x/flux2-klein, x/z-image-turbo, etc.).
+  A text LLM first enhances your description into a detailed prompt
+  optimised for diffusion models, then each image-capable model
+  generates an image saved as PNG to the current directory (or
+  --output-dir).  Use --list-models to see available image models.
+  NOTE: Image generation currently requires macOS (Ollama MLX runner).
+  Linux support is expected in a future Ollama release.
 
 k8s mode:
   The k8s mode gathers comprehensive cluster state via oc (preferred)
@@ -92,6 +115,8 @@ examples:
   %(prog)s -m search "latest Linux kernel release"
   %(prog)s -m agent "Find out what Linux kernel my machine is running and explain its key features"
   %(prog)s -m agent --max-iterations 20 "Research and summarize the CVEs from last week"
+  %(prog)s -m hack --target 192.168.1.100
+  %(prog)s -m hack --target 10.0.0.5 --max-iterations 50
   %(prog)s --no-search "What is 2+2?"
   %(prog)s -m pcap --pcap capture.pcap
   %(prog)s "Analyze /tmp/dump.pcap for errors"
@@ -101,6 +126,8 @@ examples:
   %(prog)s --metrics-only "Compare REST vs GraphQL for microservice architectures"
   %(prog)s --optimize "explain docker"
   %(prog)s --optimize-only "tell me about networking stuff"
+  %(prog)s -m image "a cat wearing a space suit on the moon"
+  %(prog)s -m image --output-dir ./images "sunset over mountain lake"
   %(prog)s --list-models
   %(prog)s --clear-memory
 """,
@@ -108,9 +135,14 @@ examples:
     parser.add_argument("query", nargs="*", help="Query to process")
     parser.add_argument(
         "--mode", "-m",
-        choices=list(CHAINS.keys()) + ["pcap", "k8s"],
+        choices=list(CHAINS.keys()) + ["pcap", "k8s", "image"],
         default="cascade",
         help="Chaining mode (default: cascade)",
+    )
+    parser.add_argument(
+        "--target", "-t",
+        metavar="HOST",
+        help="Target IP or hostname for hack mode",
     )
     parser.add_argument(
         "--pcap", "-p",
@@ -121,6 +153,11 @@ examples:
         "--kubeconfig", "-k",
         metavar="FILE",
         help="Path to kubeconfig file for k8s mode",
+    )
+    parser.add_argument(
+        "--output-dir", "-o",
+        metavar="DIR",
+        help="Output directory for generated images (default: current directory)",
     )
     parser.add_argument(
         "--no-search",
@@ -135,9 +172,9 @@ examples:
     parser.add_argument(
         "--max-iterations",
         type=int,
-        default=15,
+        default=None,
         metavar="N",
-        help="Max agent loop iterations (default: 15, agent mode only)",
+        help="Max loop iterations (default: 15 for agent, 0/unlimited for hack)",
     )
     parser.add_argument(
         "--list-models",
@@ -153,6 +190,11 @@ examples:
         "--show-memory",
         action="store_true",
         help="Show stored facts and recent sessions, then exit",
+    )
+    parser.add_argument(
+        "--show-reports",
+        action="store_true",
+        help="List saved penetration test reports, then exit",
     )
     parser.add_argument(
         "--metrics",
@@ -206,6 +248,25 @@ examples:
                     print(f"    {s['summary']}")
         sys.exit(0)
 
+    if args.show_reports:
+        from pathlib import Path
+        reports_dir = Path.home() / ".ollama_chain" / "reports"
+        if not reports_dir.exists():
+            print("No pentest reports saved yet.")
+            sys.exit(0)
+        reports = sorted(reports_dir.glob("pentest_*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not reports:
+            print("No pentest reports saved yet.")
+        else:
+            print(f"=== Pentest Reports ({len(reports)}) ===")
+            print(f"Location: {reports_dir}\n")
+            for r in reports:
+                size_kb = r.stat().st_size / 1024
+                raw = r.with_name(r.stem + "_raw.json")
+                raw_note = "  [+ raw data]" if raw.exists() else ""
+                print(f"  {r.name}  ({size_kb:.1f} KB){raw_note}")
+        sys.exit(0)
+
     models = discover_models()
     all_names = model_names(models)
 
@@ -213,8 +274,20 @@ examples:
 
     if args.list_models:
         print(list_models_table(models))
-        print(f"\n{len(models)} model(s) available.")
+        print(f"\n{len(models)} text model(s) available.")
         print(f"Cascade order: {' → '.join(all_names)}")
+        img_models = discover_image_models()
+        if img_models:
+            print(f"\nImage generation models ({len(img_models)}):")
+            for im in img_models:
+                sz = im.get("size_bytes", 0) / (1024 ** 3)
+                print(
+                    f"  {im['name']:<30} {im.get('parameter_size', '?'):<10} "
+                    f"{im.get('quantization', '?'):<10} {sz:.1f} GB"
+                )
+        else:
+            print("\nNo image generation models found. Pull one:")
+            print("  ollama pull x/flux2-klein:4b")
         sys.exit(0)
 
     use_search = not args.no_search
@@ -265,6 +338,7 @@ examples:
         pcap_path = detect_pcap_path(query)
 
     kubeconfig = args.kubeconfig
+    hack_target = args.target
 
     use_progress = not args.verbose and sys.stderr.isatty()
 
@@ -273,7 +347,7 @@ examples:
         result = _run_chain(
             args, query, all_names,
             use_search, fast_override,
-            pcap_path, kubeconfig,
+            pcap_path, kubeconfig, hack_target,
             use_progress, parser,
         )
 
@@ -300,6 +374,7 @@ def _run_chain(
     fast_override: str | None,
     pcap_path: str | None,
     kubeconfig: str | None,
+    hack_target: str | None,
     use_progress: bool,
     parser,
 ) -> str:
@@ -307,7 +382,30 @@ def _run_chain(
 
     def _execute() -> str:
         """Run the requested chain mode and return the result."""
-        if args.mode == "pcap" or pcap_path:
+        if args.mode == "hack" or hack_target:
+            target = hack_target or query
+            if not target:
+                print("Error: hack mode requires --target <host> or a target in the query", file=sys.stderr)
+                sys.exit(1)
+            chain_fn = CHAINS["hack"]
+            max_iter = args.max_iterations if args.max_iterations is not None else 0
+            return chain_fn(
+                query or target, all_names,
+                web_search=use_search,
+                fast=fast_override,
+                max_iterations=max_iter,
+                target=target,
+            )
+        elif args.mode == "image":
+            if not query:
+                print("Error: image mode requires a text description", file=sys.stderr)
+                sys.exit(1)
+            return chain_image(
+                query, all_names,
+                fast=fast_override,
+                output_dir=args.output_dir,
+            )
+        elif args.mode == "pcap" or pcap_path:
             if not pcap_path:
                 print("Error: pcap mode requires a .pcap file path (--pcap or in query)", file=sys.stderr)
                 sys.exit(1)
@@ -332,11 +430,12 @@ def _run_chain(
             sys.exit(1)
         elif args.mode == "agent":
             chain_fn = CHAINS[args.mode]
+            max_iter = args.max_iterations if args.max_iterations is not None else 15
             return chain_fn(
                 query, all_names,
                 web_search=use_search,
                 fast=fast_override,
-                max_iterations=args.max_iterations,
+                max_iterations=max_iter,
             )
         else:
             chain_fn = CHAINS[args.mode]
@@ -387,8 +486,10 @@ def _run_chain(
                 result = _fallback_answer(e)
 
             effective_query = query or pcap_path or kubeconfig or ""
-            progress_update(95, "Verifying source citations...")
-            result = ensure_sources(result, effective_query, all_names[-1])
+            skip_sources = args.mode in ("hack", "image") or hack_target
+            if not skip_sources:
+                progress_update(95, "Verifying source citations...")
+                result = ensure_sources(result, effective_query, all_names[-1])
             bar.finish()
         set_progress(None)
         return result
@@ -401,5 +502,7 @@ def _run_chain(
             result = _fallback_answer(e)
 
         effective_query = query or pcap_path or kubeconfig or ""
-        result = ensure_sources(result, effective_query, all_names[-1])
+        skip_sources = args.mode in ("hack", "image") or hack_target
+        if not skip_sources:
+            result = ensure_sources(result, effective_query, all_names[-1])
         return result

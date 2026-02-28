@@ -13,6 +13,7 @@ from ollama_chain.router import (
     build_fallback_chain,
     classify_complexity_heuristic,
     identify_parallel_candidates,
+    is_time_sensitive,
     optimize_routing,
     route_query,
     select_models_for_step,
@@ -253,6 +254,88 @@ class TestOptimizeRouting:
 # ---------------------------------------------------------------------------
 # identify_parallel_candidates
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# is_time_sensitive
+# ---------------------------------------------------------------------------
+
+class TestIsTimeSensitive:
+    def test_latest_keyword(self):
+        assert is_time_sensitive("What is the latest OpenShift release?")
+
+    def test_current_keyword(self):
+        assert is_time_sensitive("current version of Kubernetes")
+
+    def test_newest_keyword(self):
+        assert is_time_sensitive("newest Linux kernel release")
+
+    def test_most_recent_phrase(self):
+        assert is_time_sensitive("What is the most recent CVE for Apache?")
+
+    def test_version_keyword(self):
+        assert is_time_sensitive("What version of RHEL is out?")
+
+    def test_release_keyword(self):
+        assert is_time_sensitive("What release of Fedora is available?")
+
+    def test_year_keyword(self):
+        assert is_time_sensitive("Best tools for DevOps in 2025")
+
+    def test_this_week(self):
+        assert is_time_sensitive("What happened this week in Go?")
+
+    def test_not_time_sensitive_definition(self):
+        assert not is_time_sensitive("What is a binary search tree?")
+
+    def test_not_time_sensitive_concept(self):
+        assert not is_time_sensitive("Explain how TLS certificates work")
+
+    def test_not_time_sensitive_comparison(self):
+        assert not is_time_sensitive("Compare REST and GraphQL")
+
+    def test_empty_string(self):
+        assert not is_time_sensitive("")
+
+    def test_case_insensitive(self):
+        assert is_time_sensitive("LATEST VERSION OF PYTHON")
+
+
+# ---------------------------------------------------------------------------
+# Routing with time_sensitive flag
+# ---------------------------------------------------------------------------
+
+class TestRouteTimeSensitive:
+    def test_time_sensitive_upgrades_simple_to_moderate(self):
+        d = route_query("What is the latest Python version?", MODELS, use_llm=False)
+        assert d.time_sensitive is True
+        assert d.complexity != COMPLEXITY_SIMPLE
+
+    def test_time_sensitive_never_skips_search(self):
+        d = route_query("latest Docker release", MODELS, use_llm=False)
+        assert d.time_sensitive is True
+        if d.complexity == COMPLEXITY_SIMPLE:
+            pytest.fail("time-sensitive should not be simple")
+
+    def test_non_time_sensitive_can_skip_search(self):
+        d = route_query("What is SSH?", MODELS, use_llm=False)
+        assert d.time_sensitive is False
+        assert d.skip_search is True
+
+    def test_route_decision_dataclass_has_field(self):
+        d = RouteDecision(
+            models=MODELS, complexity="complex", strategy="full_cascade",
+            fallback_model="small:7b", skip_search=False, confidence=0.8,
+            time_sensitive=True,
+        )
+        assert d.time_sensitive is True
+
+    def test_time_sensitive_defaults_false(self):
+        d = RouteDecision(
+            models=MODELS, complexity="simple", strategy="direct_fast",
+            fallback_model="small:7b", skip_search=True, confidence=0.8,
+        )
+        assert d.time_sensitive is False
+
 
 class TestIdentifyParallelCandidates:
     def test_all_independent(self):
