@@ -1,0 +1,186 @@
+{"skills": [
+  {
+    "name": "code-review",
+    "description": "Code review a pull request for adherence to project standards",
+    "trigger": "When the user has completed code changes and wants to review them",
+    "commands": ["pr-review-toolkit:review-pr"]
+  },
+  {
+    "name": "test-run",
+    "description": "Run the full test suite (793+ tests across 18 test files)",
+    "trigger": "When the user wants to run tests for the codebase",
+    "commands": ["make test"],
+    "variants": {
+      "quick": "make test-quick",
+      "unit-only": "make test-unit",
+      "single-file": "make test-file F=tests/test_<name>.py",
+      "by-keyword": "make test-match K=<keyword>",
+      "failed-only": "make test-failed",
+      "coverage": "make coverage"
+    }
+  },
+  {
+    "name": "test-specific",
+    "description": "Run targeted test suites for specific subsystems",
+    "trigger": "When the user wants to test a specific module or feature area",
+    "commands": {
+      "chains": "make test-chains",
+      "agent": "make test-agent",
+      "tools": "make test-tools",
+      "search": "make test-search",
+      "router": "make test-router",
+      "memory": "make test-memory",
+      "server": "make test-server",
+      "cli": "make test-cli",
+      "validation": "make test-validation",
+      "metrics": "make test-metrics",
+      "progress": "make test-progress",
+      "quality": "make test-quality"
+    }
+  },
+  {
+    "name": "model-select",
+    "description": "Discover, list, and select appropriate Ollama models based on task requirements",
+    "trigger": "When the user needs to choose, list, or inspect models for a specific task",
+    "commands": ["make list-models", "ollama list", "ollama show <model>"],
+    "context": "Models are auto-discovered and sorted by parameter count. pick_models() selects fast (smallest) and strong (largest). ensure_memory_available() checks system RAM before loading."
+  },
+  {
+    "name": "image-generate",
+    "description": "Generate images using the Ollama image generation mode with diffusion models",
+    "trigger": "When the user wants to generate images from text descriptions",
+    "commands": ["python -m ollama_chain -m image \"<description>\""],
+    "context": "CLI-only mode. Uses discover_image_models() to find diffusion models. Supports --output-dir for saving."
+  },
+  {
+    "name": "run-chain-mode",
+    "description": "Execute any of the 11 chaining modes for multi-model orchestration",
+    "trigger": "When the user wants to run a query through the model chain pipeline",
+    "commands": {
+      "cascade": "make run-cascade QUERY=\"<query>\"",
+      "auto": "make run-auto QUERY=\"<query>\"",
+      "consensus": "make run-consensus QUERY=\"<query>\"",
+      "route": "make run-route QUERY=\"<query>\"",
+      "pipeline": "make run-pipeline QUERY=\"<query>\"",
+      "verify": "make run-verify QUERY=\"<query>\"",
+      "search": "make run-search QUERY=\"<query>\"",
+      "fast": "make run-fast QUERY=\"<query>\"",
+      "strong": "make run-strong QUERY=\"<query>\"",
+      "offline": "make run-offline QUERY=\"<query>\"",
+      "all": "make run-all QUERY=\"<query>\""
+    },
+    "context": "cascade=smallest→largest refinement, auto=router picks strategy, consensus=all answer then merge, route=complexity-based routing, pipeline=extract→classify→reason, verify=fast drafts/strong verifies, search=web-first synthesis"
+  },
+  {
+    "name": "agent-run",
+    "description": "Run the autonomous agent with planning, memory, tools, and dynamic replanning",
+    "trigger": "When the user wants to run an autonomous multi-step task with tool use",
+    "commands": ["make run-agent AGENT_GOAL=\"<goal>\" MAX_ITER=<n>"],
+    "context": "Agent decomposes goals into steps via planner.py, executes with tools (shell, file I/O, web search, port scan, python eval), maintains session memory, and replans when new facts emerge. Uses validation.py for plan integrity checks."
+  },
+  {
+    "name": "hack-mode",
+    "description": "Run the penetration testing agent against a target",
+    "trigger": "When the user wants to perform security testing or penetration testing",
+    "commands": ["make run-hack TARGET=<ip_or_host> MAX_ITER=<n>"],
+    "context": "Multi-phase attack loop: recon → scanning → enumeration → vulnerability research → exploitation → post-exploitation. Auto-adapts strategy from findings. Reports saved to disk. Requires --target."
+  },
+  {
+    "name": "pcap-analyze",
+    "description": "Deep technical analysis of .pcap/.pcapng network captures",
+    "trigger": "When the user wants to analyze packet captures for network forensics, troubleshooting, or security assessment",
+    "commands": ["make run-pcap PCAP_FILE=<path>", "python -m ollama_chain -m pcap --pcap <file>"],
+    "context": "Scapy-based parser producing 25+ analysis dimensions: protocol distribution, TCP streams with throughput, retransmission detection, RTT estimation (SYN→SYN-ACK), TLS/SSL version detection, HTTP request extraction, port scan detection, bandwidth timeline, MAC/VLAN/IP classification, DNS query+answer tracking, payload entropy analysis (encrypted traffic detection), TTL fingerprinting, GRE tunnel detection, TCP window stats. Multi-stage LLM pipeline: parse → summarize → error analysis → expert report."
+  },
+  {
+    "name": "k8s-analyze",
+    "description": "Analyze Kubernetes or OpenShift clusters for health, issues, and misconfigurations",
+    "trigger": "When the user wants to analyze a Kubernetes or OpenShift cluster",
+    "commands": ["make run-k8s KUBECONFIG=<path>"],
+    "context": "Uses oc/kubectl to collect cluster state (nodes, pods, events, resources). Formats findings for LLM analysis. CLI-only mode."
+  },
+  {
+    "name": "prompt-optimize",
+    "description": "Optimize a prompt using prompt-engineering techniques without running models",
+    "trigger": "When the user wants to improve prompt quality or see optimization suggestions",
+    "commands": ["make run-optimize QUERY=\"<query>\""],
+    "context": "Applies specificity, structure, task decomposition, few-shot, chain-of-thought, and ReAct techniques. Uses heuristic metrics and intent classification. No LLM call required."
+  },
+  {
+    "name": "prompt-metrics",
+    "description": "Evaluate prompt quality metrics (clarity, specificity, structure, actionability)",
+    "trigger": "When the user wants to score or evaluate a prompt before sending it",
+    "commands": ["make run-metrics QUERY=\"<query>\""],
+    "context": "Local heuristic scoring without LLM calls. Produces grades and improvement suggestions across 6+ dimensions. Also supports evaluate_mode_alignment() and evaluate_response()."
+  },
+  {
+    "name": "server-manage",
+    "description": "Start, monitor, and manage the ollama-chain HTTP API server",
+    "trigger": "When the user wants to start, check, or configure the API server",
+    "commands": {
+      "start": "make server",
+      "start-dev": "make server-dev",
+      "start-public": "make server-public",
+      "health": "make server-health",
+      "models": "make server-models"
+    },
+    "context": "aiohttp-based server with memory-aware scheduling, SSE streaming, job queue with timeout extension and cancellation. Default: 127.0.0.1:8585. Endpoints: /api/health, /api/models, /api/prompt, /api/jobs/<id>, /api/jobs/<id>/stream."
+  },
+  {
+    "name": "memory-manage",
+    "description": "View, search, or clear the agent's persistent memory store",
+    "trigger": "When the user wants to inspect or manage agent memory",
+    "commands": {
+      "show": "make show-memory",
+      "clear": "make clear-memory"
+    },
+    "context": "PersistentMemory stores facts, tool outputs, and learnings in ~/.ollama_chain/. SessionMemory tracks in-flight plan state, conversation history, and extracted facts."
+  },
+  {
+    "name": "build-install",
+    "description": "Build, install, or package ollama-chain",
+    "trigger": "When the user wants to install, build, or package the project",
+    "commands": {
+      "install": "make install",
+      "install-dev": "make install-dev",
+      "build": "make build",
+      "clean": "make clean",
+      "uninstall": "make uninstall"
+    },
+    "context": "Python 3.11+. Dependencies: ollama>=0.1.9, scapy>=2.7.0, ddgs>=9.0.0, aiohttp>=3.9.0. Dev: pytest, build, ruff."
+  },
+  {
+    "name": "lint-typecheck",
+    "description": "Run syntax checks, ruff linter, or mypy type checking",
+    "trigger": "When the user wants to lint or type-check the codebase",
+    "commands": {
+      "syntax": "make lint",
+      "ruff": "make lint-ruff",
+      "typecheck": "make typecheck",
+      "pre-commit": "make check",
+      "ci": "make ci"
+    },
+    "context": "lint = py_compile all .py files, lint-ruff = ruff check, typecheck = mypy with --ignore-missing-imports. check = lint + full tests. ci = lint + quick tests."
+  },
+  {
+    "name": "search-web",
+    "description": "Search the web, GitHub, Stack Overflow, or trusted docs for context enrichment",
+    "trigger": "When the user wants to research a topic, find code, or look up documentation",
+    "commands": ["python -c \"from ollama_chain.search import search_for_query; print(search_for_query('<query>'))\""],
+    "context": "Multi-source search via DuckDuckGo (no API keys). Also supports github_search(), github_search_issues(), stackoverflow_search(), docs_search(). Results are merged, tagged, and deduplicated. generate_search_queries() produces optimal search terms from natural language."
+  },
+  {
+    "name": "debug-chain",
+    "description": "Debug chain execution, routing decisions, or model selection",
+    "trigger": "When the user needs to understand why a particular chain mode produced unexpected results or wants to trace execution flow",
+    "commands": ["python -m ollama_chain -m auto --metrics-only \"<query>\""],
+    "context": "Key modules for debugging: router.py (RouteDecision, classify_complexity_heuristic/llm), chains.py (mode dispatch), validation.py (plan/step validation), planner.py (goal decomposition). Check routing with classify_complexity_heuristic() first, then trace through the selected chain_* function."
+  },
+  {
+    "name": "pentest-reports",
+    "description": "View saved penetration testing reports from hack mode runs",
+    "trigger": "When the user wants to review past penetration test results",
+    "commands": ["make show-reports"],
+    "context": "Reports are generated by hackmode.py and saved to disk after each run with findings, phases completed, and recommendations."
+  }
+]}
