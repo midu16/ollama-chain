@@ -224,3 +224,24 @@ class TestEnsureMemoryAvailable:
         from ollama_chain.models import ensure_memory_available
         ensure_memory_available(["needed:14b"])
         mock_unload.assert_not_called()
+
+
+def test_is_image_only_model_caching(mocker):
+    """Test that _is_image_only_model uses cache to avoid repeated API calls."""
+    from ollama_chain.models import _is_image_only_model, _IMAGE_ONLY_CAPABILITY, _TEXT_CAPABILITIES
+    mock_show = mocker.patch('ollama.show')
+    mock_show.return_value = {'capabilities': [_IMAGE_ONLY_CAPABILITY]}
+
+    # First call should trigger API
+    assert _is_image_only_model('image_model') is True
+    mock_show.assert_called_once()
+
+    # Second call should use cache
+    assert _is_image_only_model('image_model') is True
+    mock_show.assert_called_once()
+
+    # Test API failure
+    mock_show.side_effect = Exception('API error')
+    assert _is_image_only_model('broken_model') is False
+    assert _is_image_only_model('broken_model') is False
+    mock_show.assert_called_twice()

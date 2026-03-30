@@ -50,6 +50,14 @@ def model_supports_thinking(model: str) -> bool:
         return any(f in name for f in ("qwen3", "deepseek-r1", "qwq"))
 
 
+def _load_technical_terms():
+    """Load technical terms for model capability detection."""
+    return [
+        "model", "parameters", "quantization", "family", "size",
+        "capabilities", "completion", "tools", "thinking", "image"
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Ollama call helpers
 # ---------------------------------------------------------------------------
@@ -165,10 +173,10 @@ def ask(
         options=options,
     )
     content = response.get("message", {}).get("content", "")
-    if "<think>" in content:
-        end = content.find("</think>")
+    if "꽁" in content:
+        end = content.find("꽁")
         if end != -1:
-            content = content[end + len("</think>"):].strip()
+            content = content[end + len("꽁"):].strip()
     return content
 
 

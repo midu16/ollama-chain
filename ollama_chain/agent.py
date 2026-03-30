@@ -85,10 +85,10 @@ def _agent_chat(
                 chat_msgs[-1] = last
             resp = chat_with_retry(model=model, messages=chat_msgs, retries=2)
             text = resp["message"]["content"]
-            if "<think>" in text:
-                end = text.find("</think>")
+            if "꽁" in text:
+                end = text.find("꽁")
                 if end != -1:
-                    text = text[end + len("</think>"):].strip()
+                    text = text[end + len("꽁"):].strip()
             return model, text
         except Exception as e:
             print(
@@ -297,7 +297,7 @@ def _build_system_prompt(
                 "1. To use a tool:\n"
                 "<tool_call>\n"
                 '{"name": "tool_name", "args": {"param": "value"}}\n'
-                "</tool_call>\n\n"
+                "<tool_call>\n\n"
                 "2. To give your final answer:\n"
                 "<final_answer>\n"
                 "Your complete answer here.\n"
@@ -322,7 +322,7 @@ def _parse_response(text: str) -> dict:
     result: dict = {"type": "reasoning", "content": text}
 
     tool_match = re.search(
-        r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL,
+        r"<tool_call>\s*(.*?)\s*<tool_call>", text, re.DOTALL,
     )
     if tool_match:
         try:
@@ -1045,3 +1045,10 @@ def _finalize_session(session: SessionMemory, persistent: PersistentMemory):
     persistent.store_session_summary(session.session_id, session.goal, summary)
     print("[agent] Session saved to memory.", file=sys.stderr)
     session.clear()
+
+
+def process_query(query: str) -> str:
+    """Process a query using the agent's main functionality."""
+    from .models import discover_models, model_names
+    all_models = model_names(discover_models())
+    return run_agent(query, all_models)

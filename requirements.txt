@@ -1,3 +1,4 @@
 ollama>=0.1.9
 scapy>=2.7.0
 ddgs>=9.0.0
+python-telegram-bot

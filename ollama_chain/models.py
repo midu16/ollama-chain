@@ -45,6 +45,7 @@ def _get(obj, key, default=None):
 _IMAGE_ONLY_CAPABILITY = "image"
 _TEXT_CAPABILITIES = frozenset({"completion", "tools", "thinking"})
 
+MODEL_CAPABILITIES_CACHE = {}
 
 def _is_image_only_model(name: str) -> bool:
     """Check whether a model is image-generation-only (no text capabilities).
@@ -53,14 +54,18 @@ def _is_image_only_model(name: str) -> bool:
     the ``image`` capability (and none of completion/tools/thinking)
     are excluded from the text model cascade.
     """
+    if name in MODEL_CAPABILITIES_CACHE:
+        return MODEL_CAPABILITIES_CACHE[name]
     try:
         info = ollama.show(name)
         caps = set(_get(info, "capabilities", None) or [])
-        if _IMAGE_ONLY_CAPABILITY in caps and not caps & _TEXT_CAPABILITIES:
-            return True
+        result = (_IMAGE_ONLY_CAPABILITY in caps and not caps & _TEXT_CAPABILITIES)
+        MODEL_CAPABILITIES_CACHE[name] = result
+        return result
     except Exception:
-        pass
-    return False
+        MODEL_CAPABILITIES_CACHE[name] = False
+        return False
+
 
 
 def discover_models(*, _force: bool = False) -> list[ModelInfo]:
@@ -150,7 +155,7 @@ def _get_memory_info() -> tuple[int, int]:
     return total, available
 
 
-_LOW_MEMORY_RATIO = 0.15
+_LOW_MEMORY_RATIO = 0.05
 
 
 def ensure_memory_available(needed_models: list[str]):

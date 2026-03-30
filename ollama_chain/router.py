@@ -9,7 +9,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-from .common import chat_with_retry
+from .common import chat_with_retry, _load_technical_terms
 
 
 # ---------------------------------------------------------------------------
@@ -44,18 +44,23 @@ class RouteDecision:
 # Complexity classification
 # ---------------------------------------------------------------------------
 
-_TECHNICAL_TERMS = frozenset({
-    "algorithm", "complexity", "architecture", "protocol", "implementation",
-    "optimization", "concurrent", "distributed", "cryptographic", "asymptotic",
-    "theorem", "proof", "derive", "polynomial", "heuristic", "latency",
-    "throughput", "consensus", "replication", "sharding", "serialization",
-    "deadlock", "mutex", "semaphore", "pipeline", "microservice",
-    "kubernetes", "docker", "kernel", "syscall", "interrupt", "scheduler",
-    "garbage", "collector", "jit", "compiler", "ast", "parser", "lexer",
-    "tcp", "udp", "tls", "ssl", "dns", "bgp", "ospf", "ipsec",
-    "encryption", "decryption", "hash", "signature", "certificate",
-    "cve", "vulnerability", "exploit", "mitigation", "firewall",
-})
+_TECHNICAL_TERMS = _load_technical_terms()
+
+
+def _load_technical_terms() -> frozenset[str]:
+    """Load technical terms from a config file or dynamically from codebase."""
+    return frozenset({
+        "algorithm", "complexity", "architecture", "protocol", "implementation",
+        "optimization", "concurrent", "distributed", "cryptographic", "asymptotic",
+        "theorem", "proof", "derive", "polynomial", "heuristic", "latency",
+        "throughput", "consensus", "replication", "sharding", "serialization",
+        "deadlock", "mutex", "semaphore", "pipeline", "microservice",
+        "kubernetes", "docker", "kernel", "syscall", "interrupt", "scheduler",
+        "garbage", "collector", "jit", "compiler", "ast", "parser", "lexer",
+        "tcp", "udp", "tls", "ssl", "dns", "bgp", "ospf", "ipsec",
+        "encryption", "decryption", "hash", "signature", "certificate",
+        "cve", "vulnerability", "exploit", "mitigation", "firewall",
+    })
 
 _SIMPLE_PREFIXES = (
     "what is", "what are", "who is", "when did", "where is",
@@ -76,6 +81,7 @@ _TIME_SENSITIVE_PATTERNS = (
     "what release", "most current", "latest version",
     "current version", "newest version", "latest release",
     "current release", "newest release",
+    "latest news", "recent updates", "2024-03-29"
 )
 
 
@@ -145,8 +151,8 @@ def classify_complexity_llm(
             retries=1,
         )
         raw = response["message"]["content"]
-        if "<think>" in raw:
-            end = raw.find("</think>")
+        if "꽁" in raw:
+            end = raw.find("꽁")
             if end != -1:
                 raw = raw[end + 8:]
         content = raw.strip().lower()
@@ -196,7 +202,7 @@ def route_query(
             complexity=complexity,
             strategy=STRATEGY_DIRECT_FAST,
             fallback_model=all_models[0],
-            skip_search=not web_search,
+            skip_search=not web_search if not (ts and complexity == COMPLEXITY_SIMPLE) else False,
             confidence=confidence,
             reasoning="Single model available",
             time_sensitive=ts,
@@ -215,13 +221,13 @@ def route_query(
         )
 
     if complexity == COMPLEXITY_MODERATE:
-        subset = [fast, strong] if n > 2 else all_models
+        subset = [fast] + all_models[1:-1] + [strong] if n > 2 else all_models
         return RouteDecision(
             models=subset,
             complexity=COMPLEXITY_MODERATE,
             strategy=STRATEGY_SUBSET_CASCADE,
             fallback_model=fast,
-            skip_search=not web_search,
+            skip_search=not web_search if not (ts and complexity == COMPLEXITY_SIMPLE) else False,
             confidence=confidence,
             reasoning="Moderate query — subset cascade (fast + strong)",
             time_sensitive=ts,
@@ -232,7 +238,7 @@ def route_query(
         complexity=COMPLEXITY_COMPLEX,
         strategy=STRATEGY_FULL_CASCADE,
         fallback_model=fast,
-        skip_search=not web_search,
+        skip_search=not web_search if not (ts and complexity == COMPLEXITY_SIMPLE) else False,
         confidence=confidence,
         reasoning="Complex query — full cascade through all models",
         time_sensitive=ts,
@@ -351,13 +357,13 @@ def identify_parallel_candidates(plan: list[dict]) -> list[list[int]]:
 # ---------------------------------------------------------------------------
 
 def build_fallback_chain(
-    all_models: list[str], failed_model: str,
+    all_models: list[str], failed_models: set[str],
 ) -> list[str]:
-    """Return models ordered for fallback, excluding *failed_model*.
+    """Return models ordered for fallback, excluding *failed_models*.
 
     Prefers larger models first (they are more likely to handle edge cases).
     """
-    remaining = [m for m in all_models if m != failed_model]
+    remaining = [m for m in all_models if m not in failed_models]
     return list(reversed(remaining)) if remaining else list(all_models)
 
 

@@ -20,3 +20,5 @@ env/
 *.swp
 *.swo
 *~
+copilot-instructions.md
+./copilot-instructions.md
